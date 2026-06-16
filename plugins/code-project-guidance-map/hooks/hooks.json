@@ -26,6 +26,19 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${PLUGIN_ROOT}/hooks/guidance_map_hook.py",
+            "commandWindows": "python ${PLUGIN_ROOT}\\hooks\\guidance_map_hook.py",
+            "timeout": 10,
+            "statusMessage": "Checking AGENTS.md guidance map after task"
+          }
+        ]
+      }
     ]
   }
 }

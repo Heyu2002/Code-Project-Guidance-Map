@@ -2,9 +2,9 @@
 
 [中文说明](README-CN.md)
 
-Code Project Guidance Map is a Codex plugin and skill that helps Codex understand a repository faster and preserve that understanding in the repository root `AGENTS.md`.
+Code Project Guidance Map is a Codex plugin and skill that turns repository structure into reusable project memory for Codex.
 
-Its purpose is not to generate broad project documentation. It creates a compact, durable, refreshable action map for Codex: editing rules, task routing, dependency boundaries, and concise module ownership. Future Codex sessions can read `AGENTS.md` automatically, so the map becomes reusable project context.
+It does not try to generate a giant project manual. It creates a compact `AGENTS.md` project action index, then stores module-specific detail in separate signed Markdown files under `.agents/guidance-map/modules/`.
 
 ## Background
 
@@ -16,38 +16,35 @@ Part of the inspiration also comes from OpenAI's article [Harness engineering: l
 
 ## What It Does
 
-When you invoke this skill in a target repository, it will:
+When invoked in a target repository, the skill will:
 
-- Check whether the repository root has an `AGENTS.md`.
-- Check whether `AGENTS.md` already contains this skill's generated marker block.
-- Ask whether Codex should read the project and generate the guide when the block is missing.
-- Read the previous generation time and incrementally refresh affected modules when the block already exists.
-- Keep macro module boundary decisions in the main agent while using explicitly authorized subagents for module-internal exploration.
-- Generate `Agent Editing Rules`, `Task Routing`, and `Module Dependency Rules` sections that capture project-specific editing constraints, routing hints, and dependency boundaries.
-- Store a plugin-authenticated `hmac-sha256:v2` signature and force a full refresh if generated metadata, the signing key, or signed content no longer verifies.
-- Update only the content inside the marker block while preserving all human-written `AGENTS.md` content outside it.
-- Run lightweight plugin hooks on `SessionStart` and `UserPromptSubmit` to detect stale, missing, or unverifiable guidance and inject bounded Codex context before code edits.
+- Check whether the repository root has `AGENTS.md` and this plugin's marker block.
+- Ask before first generation unless the user already explicitly requested it.
+- Let the main agent decide the macro module map from shallow repository signals.
+- Require bounded module subagents to read module internals and write one module guide file per module.
+- Keep `AGENTS.md` as a compact project index: global editing rules, task routing, dependency rules, and module links.
+- Store module-specific structure, entry points, and local rules in `.agents/guidance-map/modules/*.md`.
+- Sign every module guide, then write the module signatures into `AGENTS.md`.
+- Sign the aggregate `AGENTS.md` index so manual edits or broken module links are detectable.
+- Incrementally refresh affected module guides from Git changes instead of rereading the whole project.
+- Run lightweight hooks on `SessionStart`, `UserPromptSubmit`, and `Stop` to detect stale, missing, or unverifiable guidance before code edits and after a task ends.
 
-The fixed marker block is:
+The fixed `AGENTS.md` marker block is:
 
 ```markdown
 <!-- code-project-guidance-map:start -->
 <!-- code-project-guidance-map:end -->
 ```
 
-The generated block is action-oriented:
+Module guide files have their own plugin-owned signature block:
 
-- `Agent Editing Rules`: high-signal `[MUST]`, `[SHOULD]`, and `[AVOID]` rules that prevent likely wrong edits.
-- `Task Routing`: common changes mapped to the paths and owning modules a future Codex session should read or edit.
-- `Module Dependency Rules`: project-specific dependency direction, forbidden dependency, ownership, and layer-flow rules.
-- `Module Map`: short human-readable module names with paths shown separately.
-- `Module Path`: the primary path or path list for the module.
-- `Owns`: the capability or domain owned by the module.
-- `Change here when`: when future edits should land in the module.
-- `Do not put here`: responsibilities that belong elsewhere.
-- `Key entry points`: compact files or directories to read first.
+```markdown
+<!-- code-project-guidance-map:module:start -->
+Signature: hmac-sha256:<64 lowercase hex chars>
+<!-- code-project-guidance-map:module:end -->
+```
 
-The marker block is plugin-owned. Manual edits to generated content invalidate the signature; the supported maintenance path is to run the skill again. By default, the helper creates a repo-scoped signing key outside the target repository under the Codex user directory. Teams or CI can provide a shared signing secret with `CODE_PROJECT_GUIDANCE_MAP_SECRET` or a key file with `CODE_PROJECT_GUIDANCE_MAP_KEY_FILE`.
+The current generator version is `0.1.0`, and the current guide format is `action-map:v3`. A missing, invalid, or major/minor-incompatible version requires a full refresh. Patch-only version differences are treated as compatible.
 
 ## Quick Start
 
@@ -77,10 +74,10 @@ codex plugin marketplace add D:\work\Code-Project-Guidance-Map-Skills
 codex plugin add code-project-guidance-map@code-project-guidance-map
 ```
 
-After installation, open a new Codex thread in the project you want to document and invoke:
+After installation, open a new Codex thread in the project you want to map and invoke:
 
 ```text
-Use $code-project-guidance-map to create or refresh this repository's AGENTS.md action map, including Agent Editing Rules, Task Routing, Module Dependency Rules, and Module Map. I explicitly authorize subagents for this run. First decide the macro module boundaries in the main agent, then spawn subagents for bounded module-internal exploration when a subagent tool is available; do not ask again for subagent approval. If subagents are unavailable, continue locally and report the fallback.
+Use $code-project-guidance-map to create or refresh this repository's signed AGENTS.md project index and per-module guide files. First decide macro module boundaries from shallow repo signals, then spawn bounded module subagents to create or refresh `.agents/guidance-map/modules/*.md`, then use the helper to sign module guides, link them from AGENTS.md, and sign the aggregate index. Do not do module-internal reading in the main thread.
 ```
 
 ## Usage
@@ -88,13 +85,13 @@ Use $code-project-guidance-map to create or refresh this repository's AGENTS.md 
 Generate the guide when Codex first joins a project:
 
 ```text
-Use $code-project-guidance-map to create the AGENTS.md action map with Agent Editing Rules, Task Routing, Module Dependency Rules, and Module Map. I explicitly authorize subagents for this run. First decide the macro module boundaries in the main agent, then spawn subagents for bounded module-internal exploration when a subagent tool is available; do not ask again for subagent approval. If subagents are unavailable, continue locally and report the fallback.
+Use $code-project-guidance-map to create this repository's signed AGENTS.md project index and per-module guide files.
 ```
 
-Refresh the guide after meaningful structure changes:
+Refresh after meaningful structure changes:
 
 ```text
-Use $code-project-guidance-map to refresh the AGENTS.md action map based on recent Git changes, including editing rules, task routing, dependency rules, and affected modules. I explicitly authorize subagents for this run. First decide the macro module boundaries in the main agent, then spawn subagents for bounded module-internal exploration when a subagent tool is available; do not ask again for subagent approval. If subagents are unavailable, continue locally and report the fallback.
+Use $code-project-guidance-map to refresh the project guidance from recent Git changes, updating only affected module guide files when possible.
 ```
 
 Use the guide before larger feature work:
@@ -103,21 +100,22 @@ Use the guide before larger feature work:
 Use $code-project-guidance-map, then help me identify where this feature should be implemented.
 ```
 
-Guide generation and refresh still happen through the skill, but the installed plugin also includes lightweight hooks. On `SessionStart`, the hook verifies the current repository's guidance block and adds bounded context if it is missing, stale, or unverifiable. On `UserPromptSubmit`, the hook only adds context for code-edit-like prompts when the guide needs attention. The hooks do not edit files or refresh `AGENTS.md`; they nudge Codex to suggest `$code-project-guidance-map` before the first code edit.
+Hooks are read-only. They verify the current repository's guidance and add bounded context when the index or module guides are missing, stale, or unverifiable. Hook reminders are state-machine driven: state is stored in the user's Codex home, but debounce decisions are scoped by project and session so one stale project does not silence another. By default, the same project/session/action is only reported once; `Stop` reminders only appear after a code-edit-like prompt in that session. Set `CODE_PROJECT_GUIDANCE_MAP_HOOK_LEVEL=off|error|stale|all` to tune hook noise.
 
-Subagents are explicit. The recommended prompts above authorize them up front, so Codex should not stop to ask again. The main agent first drafts the macro module map, then spawns the smallest useful set of subagents with bounded path scopes for internal structure and evidence. Subagents must not edit files or decide the global module map. If subagent tools are unavailable, the main agent completes the same exploration locally and reports the fallback.
+Subagents are mandatory for generation and refresh. Module subagents write their assigned module guide files directly. The main agent owns only the macro module map and the compact `AGENTS.md` index draft, then runs the helper to sign module files, backfill module signatures into the index, and write the aggregate signed `AGENTS.md` block. If subagents are unavailable, the skill falls back to `plan-only`: it outputs the macro module map, affected files, bounded subagent scopes, and follow-up command, but does not read module internals or write guidance files.
 
 ## Result
 
-After a successful run, the target repository gets an `AGENTS.md` block like this:
+After a successful run, `AGENTS.md` contains a compact index like this:
 
 ````markdown
 <!-- code-project-guidance-map:start -->
 ## Code Project Guidance Map
 
 Generator: code-project-guidance-map
-Guide format: action-map:v2
-Generated at: 2026-06-11T10:30:00Z
+Generator version: 0.1.0
+Guide format: action-map:v3
+Generated at: 2026-06-15T10:30:00Z
 Git baseline: abc1234
 Signature key id: repo:1a2b3c4d5e6f7890
 Signature: hmac-sha256:<64 lowercase hex chars>
@@ -125,27 +123,40 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 ### Agent Editing Rules
 
 - [MUST] Put new scheduling business rules in `src/core/scheduling`; expose them through API modules only after service behavior exists.
-- [MUST] Keep persistence SQL beside the owning mapper or repository path.
-- [SHOULD] Reuse existing services before adding new orchestration.
+- [SHOULD] Reuse existing services before adding orchestration.
 - [AVOID] Adding business or web dependencies to shared utility modules.
 
 ### Task Routing
 
 - To add a REST API: edit `src/api`; call services from `src/core` instead of duplicating business logic.
-- To change scheduling rules: edit `src/core/scheduling`; update matching tests before touching API response shape.
-- To change persistence SQL: edit `src/persistence` and matching mapper resources.
-- To change frontend-facing response shape: edit `src/api` DTOs and adapters.
+- To change scheduling rules: edit `src/core/scheduling`; refresh the Scheduling module guide if behavior changes.
 
 ### Module Dependency Rules
 
 - Shared utilities are the lowest-level code and must not depend on business, web, or persistence modules.
 - API modules call services; services own business rules; persistence modules own storage adapters and SQL.
-- Frontend-facing facades should orchestrate existing services instead of duplicating domain behavior.
-- Build/package boundary changes require re-checking this entire action map.
 
-### Module Map
+### Module Index
 
 #### Scheduling
+
+- Module Path: `src/core/scheduling`
+- Module Guide: `.agents/guidance-map/modules/scheduling.md`
+- Module Signature: `hmac-sha256:<64 lowercase hex chars>`
+- Owns: Scheduling rules, shift rotation decisions, and scheduling-domain service behavior.
+- Change here when: A task changes how schedules are calculated, validated, or persisted through domain services.
+- Do not put here: HTTP response shaping, frontend-only DTOs, or generic shared helpers.
+<!-- code-project-guidance-map:end -->
+````
+
+The linked module file contains the detail:
+
+````markdown
+<!-- code-project-guidance-map:module:start -->
+Signature: hmac-sha256:<64 lowercase hex chars>
+<!-- code-project-guidance-map:module:end -->
+
+# Scheduling
 
 - Module Path: `src/core/scheduling`
 - Owns: Scheduling rules, shift rotation decisions, and scheduling-domain service behavior.
@@ -159,15 +170,23 @@ src/core/scheduling/
   strategies/
   tests/
 ```
-<!-- code-project-guidance-map:end -->
+
+## Internal Structure
+
+- `services/` owns scheduling use cases.
+- `strategies/` owns rotation variants.
+
+## Local Rules
+
+- Keep scheduling rules in services or strategies, not in API adapters.
 ````
 
-This helps Codex answer questions such as:
+This layout helps Codex answer:
 
-- Where should a new feature be implemented?
 - Which module owns a behavior?
-- Which file changes affect a module?
+- Which module guide should be refreshed?
 - Which directories should be read before editing?
+- Whether a broken signature affects the whole index or only one module guide.
 
 ## Distribution
 
@@ -193,35 +212,6 @@ To publish it through a team marketplace:
 3. Keep `.agents/plugins/marketplace.json`; its marketplace name is `code-project-guidance-map`.
 4. Tell users to add the marketplace first and then install `code-project-guidance-map@code-project-guidance-map`.
 
-## Repository Layout
-
-```text
-.
-├── .github/
-│   └── workflows/
-│       └── ci.yml
-├── .agents/
-│   ├── plugins/
-│   │   └── marketplace.json
-│   └── skills/
-│       └── code-project-guidance-map/
-├── docs/
-│   ├── ci.md
-│   └── codex-skills-research.md
-├── scripts/
-│   ├── sync_plugin_skill.py
-│   └── test_sync_plugin_skill.py
-└── plugins/
-    └── code-project-guidance-map/
-        ├── .codex-plugin/
-        │   └── plugin.json
-        ├── hooks/
-        │   ├── guidance_map_hook.py
-        │   └── hooks.json
-        └── skills/
-            └── code-project-guidance-map/
-```
-
 ## Development And Validation
 
 The development skill is the source of truth:
@@ -236,6 +226,8 @@ After changing the skill, sync it into the distributable plugin copy:
 python scripts\sync_plugin_skill.py
 python scripts\sync_plugin_skill.py --check
 ```
+
+Treat drift between the development skill and plugin skill copy as a release blocker.
 
 Then validate:
 
@@ -262,6 +254,6 @@ Then start a new Codex thread so Codex loads the updated plugin.
 
 ## Project Intent
 
-This project aims to move Codex from temporary source reading toward reusable project memory.
+This project moves Codex from temporary source reading toward reusable project memory.
 
-The goal is not to produce a complete project manual. The plugin compiles the parts of a codebase that later agents need most: module boundaries, dependency direction, ownership rules, and compact navigation cues. By writing those constraints into `AGENTS.md`, later Codex sessions can locate code faster, guess less about module ownership, and participate more reliably in feature work, refactoring, and code review.
+The goal is not a complete project manual. The plugin preserves module boundaries, dependency direction, ownership rules, and compact navigation cues in a form later Codex sessions can verify and refresh incrementally.
