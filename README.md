@@ -27,6 +27,7 @@ When invoked in a target repository, the skill will:
 - Sign every module guide, then write the module signatures into `AGENTS.md`.
 - Sign the aggregate `AGENTS.md` index so manual edits or broken module links are detectable.
 - Incrementally refresh affected module guides from Git changes instead of rereading the whole project.
+- Capture a signed local-change baseline during refresh so dirty worktree files do not repeatedly trigger stale guidance until their content changes again.
 - Run lightweight hooks on `SessionStart`, `UserPromptSubmit`, and `Stop` to detect stale, missing, or unverifiable guidance before code edits and after a task ends.
 
 The fixed `AGENTS.md` marker block is:
@@ -44,7 +45,9 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 <!-- code-project-guidance-map:module:end -->
 ```
 
-The current generator version is `0.1.0`, and the current guide format is `action-map:v3`. A missing, invalid, or major/minor-incompatible version requires a full refresh. Patch-only version differences are treated as compatible.
+The current generator version is `0.2.1`, and the current guide format is `action-map:v3`. A missing, invalid, or major/minor-incompatible version requires a full refresh. Patch-only version differences are treated as compatible.
+
+Freshness is content-based for local changes. `Generated at` bounds committed Git history, while the signed `Local change baseline` records staged, unstaged, and untracked file content that existed during the last refresh. A new Codex thread should not ask for another refresh for the same dirty files unless those files change again.
 
 ## Quick Start
 
@@ -100,9 +103,20 @@ Use the guide before larger feature work:
 Use $code-project-guidance-map, then help me identify where this feature should be implemented.
 ```
 
-Hooks are read-only. They verify the current repository's guidance and add bounded context when the index or module guides are missing, stale, or unverifiable. Hook reminders are state-machine driven: state is stored in the user's Codex home, but debounce decisions are scoped by project and session so one stale project does not silence another. By default, the same project/session/action is only reported once; `Stop` reminders only appear after a code-edit-like prompt in that session. Set `CODE_PROJECT_GUIDANCE_MAP_HOOK_LEVEL=off|error|stale|all` to tune hook noise.
+## Progressive Disclosure
 
-Subagents are mandatory for generation and refresh. Module subagents write their assigned module guide files directly. The main agent owns only the macro module map and the compact `AGENTS.md` index draft, then runs the helper to sign module files, backfill module signatures into the index, and write the aggregate signed `AGENTS.md` block. If subagents are unavailable, the skill falls back to `plan-only`: it outputs the macro module map, affected files, bounded subagent scopes, and follow-up command, but does not read module internals or write guidance files.
+Generated guidance is intentionally layered. Later Codex sessions should start with the compact `AGENTS.md` index, use `Task Routing`, `Module Index`, and `verify.affected_modules` to choose relevant modules, then open only the matching module guide files. Module guides are lazy context, not startup context; ordinary tasks should usually read only 1-3 module guides before editing.
+
+Module index entries can include optional lazy-read hints:
+
+```markdown
+- Read guide when: Editing hook behavior, hook state, hook tests, or hook config.
+- Usually skip when: Only changing helper signing, README copy, or plugin marketplace metadata.
+```
+
+Hooks are read-only. They verify the current repository's guidance and add bounded context when the index or module guides are missing, stale, or unverifiable. Hook messages are state-machine driven: state is stored in the user's Codex home, but debounce decisions are scoped by project and session so one stale project does not silence another. By default, the same project/session/action is only reported once. After a code-edit-like prompt, `Stop` emits a continuation system message that tells Codex to refresh affected guidance immediately before finalizing, rather than leaving the refresh as a reminder for a later task. Set `CODE_PROJECT_GUIDANCE_MAP_HOOK_LEVEL=off|error|stale|all` to tune hook noise.
+
+Subagents are mandatory for generation and refresh. Module subagents write their assigned module guide files directly. The main agent owns only the macro module map and the compact `AGENTS.md` index draft, then runs the helper to sign module files, backfill module signatures into the index, and write the aggregate signed `AGENTS.md` block. If coding changes make guidance stale, Codex should run the affected-module refresh immediately before the final response. If subagents are unavailable, the skill falls back to `plan-only`: it outputs the macro module map, affected files, bounded subagent scopes, and follow-up command, but does not read module internals or write guidance files.
 
 ## Result
 
@@ -113,7 +127,7 @@ After a successful run, `AGENTS.md` contains a compact index like this:
 ## Code Project Guidance Map
 
 Generator: code-project-guidance-map
-Generator version: 0.1.0
+Generator version: 0.2.1
 Guide format: action-map:v3
 Generated at: 2026-06-15T10:30:00Z
 Git baseline: abc1234
@@ -123,8 +137,16 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 ### Agent Editing Rules
 
 - [MUST] Put new scheduling business rules in `src/core/scheduling`; expose them through API modules only after service behavior exists.
+- [MUST] Treat linked module guides as lazy context; start from this index and read only task-relevant module guides.
 - [SHOULD] Reuse existing services before adding orchestration.
 - [AVOID] Adding business or web dependencies to shared utility modules.
+
+### Progressive Disclosure
+
+- Start with this `AGENTS.md` index for broad orientation.
+- Read a module guide only when task routing, changed files, `verify.affected_modules`, or module index fields indicate that module is relevant.
+- Prefer reading 1-3 module guides before editing unless the task is explicitly cross-module or project-wide.
+- Do not open every linked module guide for ordinary orientation.
 
 ### Task Routing
 
@@ -146,6 +168,8 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 - Owns: Scheduling rules, shift rotation decisions, and scheduling-domain service behavior.
 - Change here when: A task changes how schedules are calculated, validated, or persisted through domain services.
 - Do not put here: HTTP response shaping, frontend-only DTOs, or generic shared helpers.
+- Read guide when: Editing scheduling rules, scheduling services, strategies, tests, or schedule persistence behavior.
+- Usually skip when: Only changing API response shaping, frontend DTOs, documentation, or generic shared helpers.
 <!-- code-project-guidance-map:end -->
 ````
 

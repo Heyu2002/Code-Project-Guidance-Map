@@ -39,6 +39,11 @@ python <installed-skill>\scripts\guidance_map.py verify --repo . --fail-on stale
 
 That also fails when changed files indicate the guidance should be refreshed.
 
+Freshness uses two boundaries:
+
+- `Generated at` bounds committed Git history.
+- `Local change baseline` is a signed snapshot of staged, unstaged, and untracked file content that existed during the last refresh. `verify` ignores those local paths while their current content still matches the snapshot, so refreshing a dirty worktree does not cause every later thread to ask for the same refresh again.
+
 ## Refresh Scope
 
 `verify` classifies changed files into:
@@ -63,5 +68,8 @@ The goal is conservative maintenance:
 - `affected_modules`: module entries whose `Module Path` matches changed files, including `changed_files` and `impact_categories`.
 - `affected_module_guides`: the affected module guide paths to refresh.
 - `unmapped_changed_files`: non-doc changed files that do not match any current `Module Index` path.
+- `changed_files_by_source.baseline_ignored`: paths ignored because they still match the signed local-change baseline.
 
-Hook reminders are debounced per user-local state file, project, and session. The default state file is under `CODEX_HOME/code-project-guidance-map/hooks/state-v1.json`; tests or custom deployments can set `CODE_PROJECT_GUIDANCE_MAP_HOOK_STATE_FILE`. Use `CODE_PROJECT_GUIDANCE_MAP_HOOK_LEVEL=off|error|stale|all` to control hook verbosity.
+Use these fields for progressive disclosure: agents should start from `AGENTS.md`, prefer `affected_module_guides` when available, and read only module guides that match the current task or changed files. Signature verification may inspect all module guide files mechanically, but model context should not load every linked guide for ordinary orientation.
+
+Hook messages are debounced per user-local state file, project, and session. The default state file is under `CODEX_HOME/code-project-guidance-map/hooks/state-v1.json`; tests or custom deployments can set `CODE_PROJECT_GUIDANCE_MAP_HOOK_STATE_FILE`. Use `CODE_PROJECT_GUIDANCE_MAP_HOOK_LEVEL=off|error|stale|all` to control hook verbosity. Stop hooks remain read-only, but after code-edit-like prompts they emit a continuation instruction so Codex refreshes affected guidance immediately before finalizing instead of leaving it as a later reminder.

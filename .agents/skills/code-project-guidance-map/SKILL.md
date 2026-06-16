@@ -9,9 +9,9 @@ description: Create or refresh a structured AGENTS.md project action index plus 
 
 Create or refresh the `code-project-guidance-map` block in the repository root `AGENTS.md`, plus signed per-module Markdown guide files under the target repository.
 
-`AGENTS.md` is only the project action index. It should contain project-level metadata, global editing/routing/dependency rules, and concise module index entries that link to separate module guides. Do not put module-internal structure, long file inventories, or deep implementation notes directly in `AGENTS.md`.
+`AGENTS.md` is only the project action index. It should contain project-level metadata, global editing/routing/dependency rules, progressive-disclosure rules, and concise module index entries that link to separate module guides. Do not put module-internal structure, long file inventories, or deep implementation notes directly in `AGENTS.md`.
 
-The module guides contain the module-specific detail. Each module guide has its own signature block. The `AGENTS.md` index records each module guide path and module signature, then gets its own aggregate signature.
+The module guides contain the module-specific detail. They are lazy context, not startup context: later agents should read a module guide only when the task routing, changed files, `verify.affected_modules`, or module index fields indicate that module is relevant. Each module guide has its own signature block. The `AGENTS.md` index records each module guide path and module signature, then gets its own aggregate signature.
 
 This skill must protect the main thread context. The main agent may do shallow repository scanning, macro module planning, index integration, and the final helper command, but module-internal reading and module-guide writing must run in subagents.
 
@@ -55,7 +55,7 @@ python <skill-dir>/scripts/guidance_map.py verify --repo <repo-root>
 
 4. If a guidance block exists:
    - Read its `Generator version`, `Generated at` timestamp, guide format, signature key id, aggregate signature, and module index.
-   - Use the script `verify` JSON to inspect Git changes since that timestamp, including committed, staged, unstaged, and untracked files.
+   - Use the script `verify` JSON to inspect Git changes since that timestamp, including committed, staged, unstaged, and untracked files. The helper filters out local changes whose current content still matches the signed `Local change baseline` captured during the last refresh.
    - If the generator version is missing, invalid, or has a different major/minor version from the current helper, perform a full refresh through the mandatory subagent workflow.
    - If only the patch version differs, keep the existing project index and module guide files as reusable unless Git changes require a scoped refresh.
    - If the aggregate `AGENTS.md` signature is invalid, perform a full refresh.
@@ -94,8 +94,10 @@ python <skill-dir>/scripts/guidance_map.py verify --repo <repo-root>
 
 8. Write the project index draft in a temporary file.
    - The index draft is the content that will appear inside the `AGENTS.md` marker block after metadata/signature lines.
-   - Use this exact section order: `### Agent Editing Rules`, `### Task Routing`, `### Module Dependency Rules`, `### Module Index`.
+   - Use this section order: `### Agent Editing Rules`, optional `### Progressive Disclosure`, `### Task Routing`, `### Module Dependency Rules`, `### Module Index`.
    - `Agent Editing Rules` is the highest-value section. Write 4-8 project-specific editing constraints with `[MUST]`, `[SHOULD]`, or `[AVOID]` tags.
+   - `Agent Editing Rules` must include one `[MUST]` rule telling later agents that linked module guides are lazy context and should not all be opened for broad orientation.
+   - `Progressive Disclosure`, when present, should answer "which guides should I read now?" in 3-6 bullets. It must say to start with `AGENTS.md`, read only task-relevant module guides, prefer `verify.affected_modules` when available, and avoid opening every module guide unless the task is explicitly project-wide.
    - `Task Routing` should answer "where do I edit for this task?" in 4-10 bullets using the shape `- To <task>: edit/read <paths>; ...`.
    - `Module Dependency Rules` should contain 4-10 dependency rules as direct bullets.
    - Put all module entries under `### Module Index`.
@@ -106,6 +108,9 @@ python <skill-dir>/scripts/guidance_map.py verify --repo <repo-root>
      - `Owns`: concise capability or domain ownership.
      - `Change here when`: concise edit-routing guidance.
      - `Do not put here`: concise boundary warning.
+   - Each module index entry may also include these optional lazy-read fields:
+     - `Read guide when`: concrete triggers for opening that module guide.
+     - `Usually skip when`: concrete tasks that should not require opening that module guide.
    - Do not include `Key entry points`, internal structure, or long implementation notes in `AGENTS.md`; those belong in module guide files.
    - The helper will add or replace `Module Signature` in each module index entry.
 
@@ -151,18 +156,27 @@ Use this shape inside the generated `AGENTS.md` block:
 ## Code Project Guidance Map
 
 Generator: code-project-guidance-map
-Generator version: 0.1.0
+Generator version: 0.2.1
 Guide format: action-map:v3
 Generated at: <ISO-8601 timestamp>
 Git baseline: <HEAD sha or none>
+Local change baseline: sha256:<digest>:<encoded local-change snapshot>
 Signature key id: <repo-scoped key id>
 Signature: hmac-sha256:<64 lowercase hex chars>
 
 ### Agent Editing Rules
 
 - [MUST] <project-specific editing rule that prevents likely wrong edits>
+- [MUST] Treat linked module guides as lazy context: start from this AGENTS.md index and read only task-relevant module guides.
 - [SHOULD] <project-specific preferred edit pattern>
 - [AVOID] <project-specific dependency, ownership, or duplication risk>
+
+### Progressive Disclosure
+
+- Start with this `AGENTS.md` index for broad orientation.
+- Read a module guide only when task routing, changed files, `verify.affected_modules`, or module index fields indicate that module is relevant.
+- Prefer reading 1-3 module guides before editing unless the task is explicitly cross-module or project-wide.
+- Do not open every linked module guide for ordinary orientation.
 
 ### Task Routing
 
@@ -184,6 +198,8 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 - Owns: <one concise sentence>
 - Change here when: <one concise sentence>
 - Do not put here: <one concise sentence>
+- Read guide when: <optional concrete triggers for opening this guide>
+- Usually skip when: <optional concrete cases that should not open this guide>
 ````
 
 Use this shape at the top of each module guide after signing:
@@ -205,6 +221,7 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 ## Incremental Update Rules
 
 - Treat the script's `verify.changed_files`, `change_impact`, `modules`, and `recommended_action` as the update scope.
+- Treat `Local change baseline` as the dirty-worktree freshness boundary: a file that was already dirty during the last refresh should not trigger another refresh until its content changes again.
 - Use module subagents for affected-module rereads and module guide rewrites.
 - Do not re-evaluate `Agent Editing Rules` or `Module Dependency Rules` for ordinary module-internal changes.
 - Re-evaluate project-level rules only when `change_impact.boundary_rules` is non-empty or index metadata/signature/format/version is invalid.
@@ -220,6 +237,8 @@ Signature: hmac-sha256:<64 lowercase hex chars>
   - build/package manifests changed in ways that alter module boundaries;
   - the existing index is too stale to safely patch incrementally.
 - Do a module-level refresh when only one or more module guide signatures are invalid, missing, or affected by local source changes.
+- After a coding task changes files and `verify.recommended_action` is `refresh_dependency_rules`, `refresh_task_routing_and_affected_modules`, or `refresh_affected_modules`, refresh the affected guidance immediately before the final response. Do not leave it as a reminder for the next task.
+- If that immediate post-edit refresh is required but subagents are unavailable, switch to `plan-only` and report the bounded refresh plan instead of silently skipping the guidance update.
 
 ## Safety Rules
 

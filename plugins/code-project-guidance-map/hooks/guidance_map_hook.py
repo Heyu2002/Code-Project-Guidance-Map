@@ -145,9 +145,10 @@ def context_for(
         )
     if event_name == "Stop":
         return (
-            "Code Project Guidance Map hook: this task finished while the repository AGENTS.md project index or module guides "
-            f"are stale, missing, or unverifiable. {summary} Before the next code edit, run $code-project-guidance-map "
-            "to refresh the signed project index and affected module guide files with bounded module subagents."
+            "Code Project Guidance Map hook: continue this task before finalizing because the repository AGENTS.md project index "
+            f"or module guides are stale, missing, or unverifiable. {summary} Run $code-project-guidance-map now to refresh "
+            "the signed project index and affected module guide files with bounded module subagents; if subagents are unavailable, "
+            "switch to plan-only instead of treating this as a reminder for later."
         )
     return (
         "Code Project Guidance Map hook: this repository's AGENTS.md project index or module guides are stale, missing, "

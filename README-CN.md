@@ -27,6 +27,7 @@ Code Project Guidance Map 是一个 Codex plugin + skill，用来把项目结构
 - 给每个模块 guide 生成独立签名，再把模块签名写回 `AGENTS.md`。
 - 给 `AGENTS.md` 索引生成总签名，用来检测人工修改、模块链接损坏或签名不一致。
 - 根据 Git 变化增量刷新受影响模块，而不是每次全量重读项目。
+- 刷新时记录一个已签名的本地变更基线，让刷新时已经存在的 dirty worktree 文件不会在内容未变时反复触发 stale。
 - 通过轻量 hooks 在 `SessionStart`、`UserPromptSubmit` 和 `Stop` 时检查指引是否缺失、过期或无法验签。
 
 `AGENTS.md` 的固定 marker 是：
@@ -44,7 +45,9 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 <!-- code-project-guidance-map:module:end -->
 ```
 
-当前生成器版本是 `0.1.0`，当前 guide 格式是 `action-map:v3`。版本缺失、格式非法，或 major/minor 不兼容时需要完整刷新。只有 patch 版本不同会被视为兼容。
+当前生成器版本是 `0.2.1`，当前 guide 格式是 `action-map:v3`。版本缺失、格式非法，或 major/minor 不兼容时需要完整刷新。只有 patch 版本不同会被视为兼容。
+
+本地变更的新鲜度按内容判断。`Generated at` 用来界定已提交 Git 历史；已签名的 `Local change baseline` 会记录上次刷新时已经存在的 staged、unstaged 和 untracked 文件内容。新开 Codex thread 时，同一批 dirty 文件只要内容没再变化，就不应该再次要求刷新。
 
 ## 快速启动
 
@@ -100,9 +103,20 @@ Use $code-project-guidance-map to refresh the project guidance from recent Git c
 Use $code-project-guidance-map, then help me identify where this feature should be implemented.
 ```
 
-hooks 是只读的。它们会验证当前仓库的 `AGENTS.md` 索引和模块 guide 签名，并在缺失、过期或无法验签时给 Codex 注入有边界的上下文。`Stop` 使用 hook `systemMessage` 作为任务结束提醒，因为 stop hooks 不支持 `hookSpecificOutput`。hooks 不会编辑文件，也不会自动刷新指引。
+## 渐进式披露
 
-生成和刷新必须使用 subagents。模块 subagent 直接写自己负责的模块 guide 文件。主 agent 只负责宏观模块划分和紧凑的 `AGENTS.md` 索引草稿，然后运行 helper 给模块文件签名、把模块签名回填进索引，并写入带总签名的 `AGENTS.md` 区块。
+生成的指引是分层的。后续 Codex 会话应该先读紧凑的 `AGENTS.md` 索引，再根据 `Task Routing`、`Module Index` 和 `verify.affected_modules` 选择相关模块，只打开命中的模块 guide。模块 guide 是懒加载上下文，不是启动上下文；普通任务通常只需要在编辑前读取 1-3 个相关模块 guide。
+
+模块索引条目可以包含可选的懒加载提示：
+
+```markdown
+- Read guide when: Editing hook behavior, hook state, hook tests, or hook config.
+- Usually skip when: Only changing helper signing, README copy, or plugin marketplace metadata.
+```
+
+hooks 是只读的。它们会验证当前仓库的 `AGENTS.md` 索引和模块 guide 签名，并在缺失、过期或无法验签时给 Codex 注入有边界的上下文。hook 消息由状态机降噪：状态保存在用户的 Codex home 下，但判断粒度是项目和 session。默认同一个项目、同一个 session、同一个 action 只提示一次。发生过代码编辑类 prompt 后，`Stop` 会发出 continuation system message，要求 Codex 在 final 前立即刷新受影响指引，而不是把刷新留作下一次任务的提醒。hooks 不会自己编辑文件。
+
+生成和刷新必须使用 subagents。模块 subagent 直接写自己负责的模块 guide 文件。主 agent 只负责宏观模块划分和紧凑的 `AGENTS.md` 索引草稿，然后运行 helper 给模块文件签名、把模块签名回填进索引，并写入带总签名的 `AGENTS.md` 区块。如果编码改动让指引过期，Codex 应该在 final 前立即刷新受影响模块；如果 subagents 不可用，则进入 `plan-only`，只输出有边界的刷新计划，不读模块内部、不写指引文件。
 
 ## 会产生什么
 
@@ -113,7 +127,7 @@ hooks 是只读的。它们会验证当前仓库的 `AGENTS.md` 索引和模块 
 ## Code Project Guidance Map
 
 Generator: code-project-guidance-map
-Generator version: 0.1.0
+Generator version: 0.2.1
 Guide format: action-map:v3
 Generated at: 2026-06-15T10:30:00Z
 Git baseline: abc1234
@@ -123,8 +137,16 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 ### Agent Editing Rules
 
 - [MUST] Put new scheduling business rules in `src/core/scheduling`; expose them through API modules only after service behavior exists.
+- [MUST] Treat linked module guides as lazy context; start from this index and read only task-relevant module guides.
 - [SHOULD] Reuse existing services before adding orchestration.
 - [AVOID] Adding business or web dependencies to shared utility modules.
+
+### Progressive Disclosure
+
+- Start with this `AGENTS.md` index for broad orientation.
+- Read a module guide only when task routing, changed files, `verify.affected_modules`, or module index fields indicate that module is relevant.
+- Prefer reading 1-3 module guides before editing unless the task is explicitly cross-module or project-wide.
+- Do not open every linked module guide for ordinary orientation.
 
 ### Task Routing
 
@@ -146,6 +168,8 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 - Owns: Scheduling rules, shift rotation decisions, and scheduling-domain service behavior.
 - Change here when: A task changes how schedules are calculated, validated, or persisted through domain services.
 - Do not put here: HTTP response shaping, frontend-only DTOs, or generic shared helpers.
+- Read guide when: Editing scheduling rules, scheduling services, strategies, tests, or schedule persistence behavior.
+- Usually skip when: Only changing API response shaping, frontend DTOs, documentation, or generic shared helpers.
 <!-- code-project-guidance-map:end -->
 ````
 

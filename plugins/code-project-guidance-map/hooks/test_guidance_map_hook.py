@@ -310,7 +310,9 @@ class GuidanceMapHookTests(unittest.TestCase):
         output = self.parse_hook_output(self.run_hook(stop_payload))
         self.assertIsNotNone(output)
         context = output["systemMessage"]  # type: ignore[index]
-        self.assertIn("this task finished", context)
+        self.assertIn("continue this task before finalizing", context)
+        self.assertIn("Run $code-project-guidance-map now", context)
+        self.assertIn("plan-only", context)
         self.assertIn("$code-project-guidance-map", context)
         self.assertNotIn("hookSpecificOutput", output)
         self.assertIsNone(self.parse_hook_output(self.run_hook(stop_payload)))

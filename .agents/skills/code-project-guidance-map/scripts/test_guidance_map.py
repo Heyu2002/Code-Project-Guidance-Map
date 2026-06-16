@@ -54,7 +54,11 @@ class GuidanceMapTests(unittest.TestCase):
         return (
             "### Agent Editing Rules\n\n"
             "- [MUST] Keep App changes inside `app` unless routing says otherwise.\n"
+            "- [MUST] Treat linked module guides as lazy context; read only task-relevant guides.\n"
             "- [SHOULD] Reuse existing services before adding orchestration.\n\n"
+            "### Progressive Disclosure\n\n"
+            "- Start with AGENTS.md for broad orientation.\n"
+            "- Read module guides only when routing or changed files point to them.\n\n"
             "### Task Routing\n\n"
             "- To add an API: edit `app/routes`; keep behavior in `app/services`.\n\n"
             "### Module Dependency Rules\n\n"
@@ -66,6 +70,8 @@ class GuidanceMapTests(unittest.TestCase):
             f"- Owns: {owns}\n"
             "- Change here when: B\n"
             "- Do not put here: C\n"
+            "- Read guide when: Editing App behavior.\n"
+            "- Usually skip when: Only changing docs.\n"
         )
 
     def module_doc_text(self, owns: str = "A") -> str:
@@ -95,8 +101,9 @@ class GuidanceMapTests(unittest.TestCase):
         self.assertTrue(result["has_block"])
         self.assertIn(guidance_map.START_MARKER, text)
         self.assertIn("Generator: code-project-guidance-map", text)
-        self.assertIn("Generator version: 0.1.0", text)
+        self.assertIn("Generator version: 0.2.1", text)
         self.assertIn("Guide format: action-map:v3", text)
+        self.assertIn("Local change baseline: sha256:", text)
         self.assertIn("Signature key id: repo:", text)
         self.assertNotIn("Signature algorithm:", text)
         self.assertRegex(text, r"Signature: hmac-sha256:[0-9a-f]{64}")
@@ -106,6 +113,10 @@ class GuidanceMapTests(unittest.TestCase):
         module_text = (self.repo / ".agents" / "guidance-map" / "modules" / "app.md").read_text(encoding="utf-8")
         self.assertIn(guidance_map.MODULE_START_MARKER, module_text)
         self.assertRegex(module_text, r"Signature: hmac-sha256:[0-9a-f]{64}")
+        status = guidance_map.status(self.repo)
+        self.assertTrue(status["local_change_baseline_valid"])
+        self.assertEqual(status["modules"][0]["read_guide_when"], "Editing App behavior.")
+        self.assertEqual(status["modules"][0]["usually_skip_when"], "Only changing docs.")
 
     def test_status_validates_signature(self) -> None:
         guidance_map.update(self.repo, self.write_guidance(), "2026-01-01T00:00:00Z")
@@ -190,7 +201,7 @@ class GuidanceMapTests(unittest.TestCase):
 
     def test_status_reports_missing_generator_version(self) -> None:
         block = render_test_block("body", "2026-01-01T00:00:00Z", "abc123")
-        block = block.replace("Generator version: 0.1.0\n", "")
+        block = block.replace("Generator version: 0.2.1\n", "")
         (self.repo / "AGENTS.md").write_text(block, encoding="utf-8")
         result = guidance_map.status(self.repo)
         self.assertTrue(result["has_block"])
@@ -199,7 +210,7 @@ class GuidanceMapTests(unittest.TestCase):
         self.assertTrue(result["requires_full_read"])
 
     def test_verify_incompatible_generator_version_requires_full_refresh(self) -> None:
-        block = render_test_block("body", "2026-01-01T00:00:00Z", "abc123", "0.2.0")
+        block = render_test_block("body", "2026-01-01T00:00:00Z", "abc123", "0.1.0")
         (self.repo / "AGENTS.md").write_text(block, encoding="utf-8")
         result = guidance_map.verify(self.repo)
         self.assertEqual(result["generator_version_status"], "incompatible")
@@ -227,26 +238,28 @@ class GuidanceMapTests(unittest.TestCase):
             "none",
             key_id,
             module_body,
-            "0.1.1",
+            "0.2.2",
         )
         module_path.write_text(guidance_map.update_module_signature_text(module_path.read_text(encoding="utf-8"), module_signature), encoding="utf-8")
-        block = block.replace("Generator version: 0.1.0", "Generator version: 0.1.1")
+        block = block.replace("Generator version: 0.2.1", "Generator version: 0.2.2")
         block = re.sub(r"^- Module Signature:\s*.*$", f"- Module Signature: `{module_signature}`", block, count=1, flags=re.MULTILINE)
         block_info = guidance_map.find_block(block)
         assert block_info is not None
         guidance_body = guidance_map.guidance_body_from_block(block_info[2])
         assert guidance_body is not None
+        local_baseline = guidance_map.metadata_value(guidance_map.LOCAL_CHANGE_BASELINE_RE, block_info[2])
         signature = guidance_map.compute_signature(
             TEST_SECRET,
             "project-index",
             guidance_map.GENERATOR,
-            "0.1.1",
+            "0.2.2",
             guidance_map.GUIDE_FORMAT,
             "2026-01-01T00:00:00Z",
             "none",
             guidance_map.SIGNATURE_ALGORITHM,
             key_id,
             guidance_body,
+            local_baseline,
         )
         block = re.sub(r"^Signature:\s*.*$", f"Signature: {signature}", block, count=1, flags=re.MULTILINE)
         agents_path.write_text(block, encoding="utf-8")
@@ -258,10 +271,10 @@ class GuidanceMapTests(unittest.TestCase):
         self.assertFalse(result["stale"])
 
     def test_generator_version_status_uses_semver_compatibility(self) -> None:
-        self.assertEqual(guidance_map.generator_version_status("0.1.1", "0.1.0"), "patch-compatible")
-        self.assertEqual(guidance_map.generator_version_status("0.2.0", "0.1.0"), "incompatible")
-        self.assertEqual(guidance_map.generator_version_status("1.0.0", "0.1.0"), "incompatible")
-        self.assertEqual(guidance_map.generator_version_status("bad", "0.1.0"), "invalid")
+        self.assertEqual(guidance_map.generator_version_status("0.2.2", "0.2.1"), "patch-compatible")
+        self.assertEqual(guidance_map.generator_version_status("0.3.0", "0.2.1"), "incompatible")
+        self.assertEqual(guidance_map.generator_version_status("1.0.0", "0.2.1"), "incompatible")
+        self.assertEqual(guidance_map.generator_version_status("bad", "0.2.1"), "invalid")
 
     def test_update_rejects_missing_required_sections(self) -> None:
         path = self.write_guidance("### Module Index\n\n#### App\n\n- Module Path: `app`\n")
@@ -374,6 +387,9 @@ class GuidanceMapGitTests(unittest.TestCase):
         index = (
             "### Agent Editing Rules\n\n"
             "- [MUST] Keep App changes inside `src/main/java/app`.\n\n"
+            "### Progressive Disclosure\n\n"
+            "- Start with AGENTS.md for broad orientation.\n"
+            "- Read App guide only when App paths changed.\n\n"
             "### Task Routing\n\n"
             "- To add an API: edit `src/main/java/app/controller`.\n\n"
             "### Module Dependency Rules\n\n"
@@ -385,6 +401,8 @@ class GuidanceMapGitTests(unittest.TestCase):
             "- Owns: Application behavior.\n"
             "- Change here when: Application behavior changes.\n"
             "- Do not put here: Shared utilities.\n"
+            "- Read guide when: Editing App runtime or tests.\n"
+            "- Usually skip when: Only changing plugin metadata.\n"
         )
         guidance_path = self.repo / "guidance.md"
         guidance_path.write_text(index, encoding="utf-8")
@@ -454,7 +472,57 @@ class GuidanceMapGitTests(unittest.TestCase):
         self.assertTrue(result["stale"])
         self.assertEqual(result["change_impact"]["module_internal"], ["src/main/java/app/model/User.java"])
         self.assertEqual(result["affected_module_guides"], [".agents/guidance-map/modules/app.md"])
+        self.assertEqual(result["affected_modules"][0]["read_guide_when"], "Editing App runtime or tests.")
+        self.assertEqual(result["affected_modules"][0]["usually_skip_when"], "Only changing plugin metadata.")
         self.assertEqual(result["unmapped_changed_files"], [])
+
+    def test_update_baselines_existing_dirty_worktree_changes(self) -> None:
+        self.commit_guide()
+        relpath = "src/main/java/app/model/User.java"
+        path = self.repo / relpath
+        path.parent.mkdir(parents=True)
+        path.write_text("class User {}\n", encoding="utf-8")
+        before = guidance_map.verify(self.repo)
+        self.assertEqual(before["recommended_action"], "refresh_affected_modules")
+
+        guidance_map.update(self.repo, self.repo / "guidance.md", "2027-01-01T00:00:00Z")
+        after = guidance_map.verify(self.repo)
+        self.assertNotIn(relpath, after["changed_files"])
+        self.assertIn(relpath, after["changed_files_by_source"]["baseline_ignored"])
+        self.assertFalse(after["stale"])
+
+        path.write_text("class User { int id; }\n", encoding="utf-8")
+        changed_after_refresh = guidance_map.verify(self.repo)
+        self.assertEqual(changed_after_refresh["recommended_action"], "refresh_affected_modules")
+        self.assertIn(relpath, changed_after_refresh["changed_files"])
+
+    def test_local_change_baseline_ignores_same_content_after_later_commit(self) -> None:
+        self.commit_guide()
+        relpath = "src/main/java/app/model/User.java"
+        path = self.repo / relpath
+        path.parent.mkdir(parents=True)
+        path.write_text("class User {}\n", encoding="utf-8")
+
+        guidance_map.update(self.repo, self.repo / "guidance.md", "2027-01-01T00:00:00Z")
+        self.git("add", relpath)
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_DATE": "2027-01-02T00:00:00Z",
+            "GIT_COMMITTER_DATE": "2027-01-02T00:00:00Z",
+        }
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-m", "code"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            env=env,
+        )
+
+        result = guidance_map.verify(self.repo)
+        self.assertNotIn(relpath, result["changed_files"])
+        self.assertIn(relpath, result["changed_files_by_source"]["baseline_ignored"])
+        self.assertFalse(result["stale"])
 
     def test_verify_multi_path_module_mapping(self) -> None:
         self.commit_guide("`src/main/java/app`, `src/test/java/app`; `shared/app`")

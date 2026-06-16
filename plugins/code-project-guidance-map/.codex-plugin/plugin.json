@@ -1,6 +1,6 @@
 {
   "name": "code-project-guidance-map",
-  "version": "0.1.0+codex.20260615034510",
+  "version": "0.2.1",
   "description": "Create signed AGENTS.md project indexes and per-module guide files for Codex project editing.",
   "author": {
     "name": "Heyu2002"
