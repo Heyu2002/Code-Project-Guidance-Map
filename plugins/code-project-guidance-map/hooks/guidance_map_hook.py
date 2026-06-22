@@ -119,12 +119,17 @@ def context_for(
     verification: dict[str, Any] | None,
     error: str | None,
     include_info: bool = False,
+    repo: str | None = None,
 ) -> str | None:
+    repo_arg = repo or "<repo-root>"
+    build_command = f"python {GUIDANCE_MAP} build --repo {repo_arg} --launcher auto --context <current-request-summary>"
     if error:
         return (
             "Code Project Guidance Map hook: AGENTS.md action map could not be verified. "
-            f"{error}. Before the next code edit, suggest running $code-project-guidance-map to refresh the signed project index "
-            "with bounded module subagents; do not do a main-thread full project read."
+            f"{error}. Before the next code edit, run the helper build command so a single script-coordinated builder agent "
+            f"refreshes the signed project index: `{build_command}`. In Codex Desktop, if the helper returns "
+            "`desktop_launch_required`, create the Desktop builder thread from the returned prompt and attach it. "
+            "Do not build the map directly in this thread."
         )
     if not verification:
         return None
@@ -139,21 +144,24 @@ def context_for(
     if event_name == "UserPromptSubmit":
         return (
             "Code Project Guidance Map hook: this looks like a code-edit request, and the repository "
-            f"AGENTS.md project index or module guides are stale or unverifiable. {summary} Before editing code, use "
-            "$code-project-guidance-map to refresh the signed project index and affected module guide files with bounded module subagents, "
-            "or explicitly explain why the edit can proceed without it."
+            f"AGENTS.md project index or module guides are stale or unverifiable. {summary} Before editing code, run "
+            f"the helper build command so the single script-coordinated builder agent refreshes the signed project index "
+            f"and affected module guide files: `{build_command}`. If another builder is active, the helper will synchronize "
+            "this thread's context instead of starting a second builder. In Codex Desktop, handle `desktop_launch_required` "
+            "by creating the returned-prompt builder thread and attaching it."
         )
     if event_name == "Stop":
         return (
             "Code Project Guidance Map hook: continue this task before finalizing because the repository AGENTS.md project index "
-            f"or module guides are stale, missing, or unverifiable. {summary} Run $code-project-guidance-map now to refresh "
-            "the signed project index and affected module guide files with bounded module subagents; if subagents are unavailable, "
-            "switch to plan-only instead of treating this as a reminder for later."
+            f"or module guides are stale, missing, or unverifiable. {summary} Run the helper build command now so the single "
+            f"script-coordinated builder agent refreshes the signed project index and affected module guide files: `{build_command}`. "
+            "If another builder is active, the helper will queue this context for the active builder. In Codex Desktop, handle "
+            "`desktop_launch_required` by creating the returned-prompt builder thread and attaching it."
         )
     return (
         "Code Project Guidance Map hook: this repository's AGENTS.md project index or module guides are stale, missing, "
-        f"or unverifiable. {summary} Before the first code edit in this thread, suggest running "
-        "$code-project-guidance-map with bounded module subagents."
+        f"or unverifiable. {summary} Before the first code edit in this thread, suggest running the helper build command "
+        "so a single script-coordinated builder agent owns the refresh."
     )
 
 
@@ -191,7 +199,7 @@ def main() -> int:
     hook_state.save_state(decision.state)
     if not decision.should_emit:
         return 0
-    hook_output(event_name, context_for(event_name, verification, error, include_info=decision.include_info))
+    hook_output(event_name, context_for(event_name, verification, error, include_info=decision.include_info, repo=cwd))
     return 0
 
 

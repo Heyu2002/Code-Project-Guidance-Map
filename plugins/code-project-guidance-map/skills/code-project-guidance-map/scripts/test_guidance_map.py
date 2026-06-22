@@ -7,11 +7,14 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import guidance_map
 
@@ -36,8 +39,20 @@ class GuidanceMapTests(unittest.TestCase):
         self.repo = Path(self.tmp.name)
         self.old_secret = os.environ.get(guidance_map.SIGNATURE_SECRET_ENV)
         self.old_key_home = os.environ.get(guidance_map.SIGNATURE_KEY_HOME_ENV)
+        self.old_build_home = os.environ.get(guidance_map.BUILD_HOME_ENV)
+        self.old_codex_command = os.environ.get(guidance_map.BUILD_CODEX_COMMAND_ENV)
+        self.old_validate_codex = os.environ.get(guidance_map.BUILD_CODEX_VALIDATE_ENV)
+        self.old_launcher = os.environ.get(guidance_map.BUILD_LAUNCHER_ENV)
+        self.old_desktop_grace = os.environ.get(guidance_map.BUILD_DESKTOP_LAUNCH_GRACE_SECONDS_ENV)
+        self.old_originator = os.environ.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE")
         os.environ[guidance_map.SIGNATURE_SECRET_ENV] = TEST_SECRET_HEX
         os.environ[guidance_map.SIGNATURE_KEY_HOME_ENV] = str(self.repo / ".keys")
+        os.environ[guidance_map.BUILD_HOME_ENV] = str(self.repo / ".build-state")
+        os.environ.pop(guidance_map.BUILD_CODEX_COMMAND_ENV, None)
+        os.environ.pop(guidance_map.BUILD_CODEX_VALIDATE_ENV, None)
+        os.environ.pop(guidance_map.BUILD_LAUNCHER_ENV, None)
+        os.environ.pop(guidance_map.BUILD_DESKTOP_LAUNCH_GRACE_SECONDS_ENV, None)
+        os.environ.pop("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", None)
 
     def tearDown(self) -> None:
         if self.old_secret is None:
@@ -48,6 +63,30 @@ class GuidanceMapTests(unittest.TestCase):
             os.environ.pop(guidance_map.SIGNATURE_KEY_HOME_ENV, None)
         else:
             os.environ[guidance_map.SIGNATURE_KEY_HOME_ENV] = self.old_key_home
+        if self.old_build_home is None:
+            os.environ.pop(guidance_map.BUILD_HOME_ENV, None)
+        else:
+            os.environ[guidance_map.BUILD_HOME_ENV] = self.old_build_home
+        if self.old_codex_command is None:
+            os.environ.pop(guidance_map.BUILD_CODEX_COMMAND_ENV, None)
+        else:
+            os.environ[guidance_map.BUILD_CODEX_COMMAND_ENV] = self.old_codex_command
+        if self.old_validate_codex is None:
+            os.environ.pop(guidance_map.BUILD_CODEX_VALIDATE_ENV, None)
+        else:
+            os.environ[guidance_map.BUILD_CODEX_VALIDATE_ENV] = self.old_validate_codex
+        if self.old_launcher is None:
+            os.environ.pop(guidance_map.BUILD_LAUNCHER_ENV, None)
+        else:
+            os.environ[guidance_map.BUILD_LAUNCHER_ENV] = self.old_launcher
+        if self.old_desktop_grace is None:
+            os.environ.pop(guidance_map.BUILD_DESKTOP_LAUNCH_GRACE_SECONDS_ENV, None)
+        else:
+            os.environ[guidance_map.BUILD_DESKTOP_LAUNCH_GRACE_SECONDS_ENV] = self.old_desktop_grace
+        if self.old_originator is None:
+            os.environ.pop("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", None)
+        else:
+            os.environ["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] = self.old_originator
         self.tmp.cleanup()
 
     def guidance_text(self, owns: str = "A") -> str:
@@ -334,6 +373,194 @@ class GuidanceMapTests(unittest.TestCase):
         text = f"{guidance_map.START_MARKER}\nmissing end"
         with self.assertRaises(guidance_map.GuidanceMapError):
             guidance_map.find_block(text)
+
+    def test_build_queues_context_when_builder_is_active(self) -> None:
+        root, git_available = guidance_map.repo_root(self.repo)
+        state_dir = guidance_map.build_state_dir(root, git_available)
+        active = {
+            "build_id": "active-build",
+            "repo_root": str(root),
+            "project_id": guidance_map.project_id(root, git_available),
+            "status": "launching",
+            "started_at": guidance_map.utc_now(),
+            "pid": None,
+        }
+        state = guidance_map.read_build_state(state_dir, root, git_available)
+        state["active"] = active
+        guidance_map.write_active_lock(state_dir, active)
+        guidance_map.write_build_state(state_dir, state)
+
+        result = guidance_map.start_guidance_build(
+            self.repo,
+            reason="test-refresh",
+            context="new request context",
+            codex_command="definitely-missing-codex",
+        )
+
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(result["active_build_id"], "active-build")
+        self.assertEqual(result["pending_context_count"], 1)
+
+        with self.assertRaises(guidance_map.GuidanceMapError):
+            guidance_map.finish_guidance_build(self.repo, "active-build", "complete")
+
+        drained = guidance_map.drain_build_context(self.repo, "active-build")
+        self.assertEqual(drained["pending_context_count"], 1)
+        self.assertEqual(drained["pending_contexts"][0]["context"], "new request context")
+
+        finished = guidance_map.finish_guidance_build(self.repo, "active-build", "abandoned")
+        self.assertEqual(finished["status"], "finished")
+        self.assertFalse(guidance_map.build_active_lock_path(state_dir).exists())
+
+    def test_build_queues_before_launcher_resolution_when_builder_is_active(self) -> None:
+        root, git_available = guidance_map.repo_root(self.repo)
+        state_dir = guidance_map.build_state_dir(root, git_available)
+        active = {
+            "build_id": "active-build",
+            "repo_root": str(root),
+            "project_id": guidance_map.project_id(root, git_available),
+            "status": "launching",
+            "started_at": guidance_map.utc_now(),
+            "pid": None,
+        }
+        state = guidance_map.read_build_state(state_dir, root, git_available)
+        state["active"] = active
+        guidance_map.write_active_lock(state_dir, active)
+        guidance_map.write_build_state(state_dir, state)
+
+        with mock.patch("guidance_map.shutil.which", return_value=None):
+            result = guidance_map.start_guidance_build(
+                self.repo,
+                reason="active-refresh",
+                context="queue without launcher discovery",
+                launcher="cli",
+            )
+
+        self.assertEqual(result["status"], "queued")
+        drained = guidance_map.drain_build_context(self.repo, "active-build")
+        self.assertEqual(drained["pending_contexts"][0]["context"], "queue without launcher discovery")
+        finished = guidance_map.finish_guidance_build(self.repo, "active-build", "abandoned")
+        self.assertEqual(finished["status"], "finished")
+
+    def test_build_starts_script_coordinated_cli_agent(self) -> None:
+        fake_codex = self.repo / "fake_codex.py"
+        fake_codex.write_text(
+            "import pathlib, sys, time\n"
+            "args = sys.argv[1:]\n"
+            "prompt = sys.stdin.read()\n"
+            "if '-o' in args:\n"
+            "    pathlib.Path(args[args.index('-o') + 1]).write_text('started\\n', encoding='utf-8')\n"
+            "pathlib.Path('captured-prompt.txt').write_text(prompt, encoding='utf-8')\n"
+            "time.sleep(5)\n",
+            encoding="utf-8",
+        )
+
+        result = guidance_map.start_guidance_build(
+            self.repo,
+            reason="launch-test",
+            context="launch context",
+            codex_command=f"{sys.executable} {fake_codex}",
+        )
+
+        self.assertEqual(result["status"], "started")
+        self.assertTrue(Path(str(result["prompt_file"])).exists())
+        prompt = Path(str(result["prompt_file"])).read_text(encoding="utf-8")
+        self.assertIn("script-coordinated Code Project Guidance Map builder agent", prompt)
+        self.assertIn("launch context", prompt)
+
+        pid = int(result["pid"])
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        time.sleep(0.1)
+        finished = guidance_map.finish_guidance_build(self.repo, str(result["build_id"]), "abandoned", force=True)
+        self.assertEqual(finished["finish_status"], "abandoned")
+
+    def test_default_build_requires_runnable_codex_command(self) -> None:
+        old_path = os.environ.get("PATH")
+        try:
+            os.environ["PATH"] = ""
+            with self.assertRaises(guidance_map.GuidanceMapError) as raised:
+                guidance_map.resolve_codex_command(None)
+        finally:
+            if old_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = old_path
+        self.assertIn("Unable to find a runnable `codex` command", str(raised.exception))
+
+    def test_configured_codex_command_bypasses_default_discovery(self) -> None:
+        command = guidance_map.resolve_codex_command(f"{sys.executable} fake_codex.py")
+        self.assertEqual(command, [sys.executable, "fake_codex.py"])
+
+    def test_auto_build_falls_back_to_desktop_handoff_in_desktop_thread(self) -> None:
+        os.environ["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] = "Codex Desktop"
+        with mock.patch("guidance_map.shutil.which", return_value=None):
+            result = guidance_map.start_guidance_build(
+                self.repo,
+                reason="desktop-refresh",
+                context="desktop-only request context",
+                launcher="auto",
+            )
+
+        self.assertEqual(result["status"], "desktop_launch_required")
+        self.assertEqual(result["launcher"], "desktop")
+        self.assertIn("desktop-only request context", result["prompt"])
+        self.assertTrue(Path(str(result["prompt_file"])).exists())
+        self.assertIn("build-attach", result["attach_command"])
+
+        attached = guidance_map.attach_desktop_builder_thread(self.repo, str(result["build_id"]), "thread-123")
+        self.assertEqual(attached["status"], "attached")
+        self.assertEqual(attached["thread_id"], "thread-123")
+
+        queued = guidance_map.start_guidance_build(
+            self.repo,
+            reason="queued-desktop-refresh",
+            context="second desktop request",
+            codex_command="definitely-missing-codex",
+        )
+        self.assertEqual(queued["status"], "queued")
+        self.assertEqual(queued["active_build_id"], result["build_id"])
+
+        drained = guidance_map.drain_build_context(self.repo, str(result["build_id"]))
+        self.assertEqual(drained["pending_context_count"], 1)
+        self.assertEqual(drained["pending_contexts"][0]["context"], "second desktop request")
+        finished = guidance_map.finish_guidance_build(self.repo, str(result["build_id"]), "abandoned")
+        self.assertEqual(finished["finish_status"], "abandoned")
+
+    def test_cli_launcher_does_not_fallback_to_desktop_handoff(self) -> None:
+        os.environ["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] = "Codex Desktop"
+        with mock.patch("guidance_map.shutil.which", return_value=None):
+            with self.assertRaises(guidance_map.GuidanceMapError) as raised:
+                guidance_map.start_guidance_build(self.repo, launcher="cli")
+        self.assertIn("Unable to find a runnable `codex` command", str(raised.exception))
+
+    def test_build_attach_rejects_non_desktop_builder(self) -> None:
+        fake_codex = self.repo / "fake_codex.py"
+        fake_codex.write_text(
+            "import sys, time\n"
+            "sys.stdin.read()\n"
+            "time.sleep(5)\n",
+            encoding="utf-8",
+        )
+        result = guidance_map.start_guidance_build(
+            self.repo,
+            reason="launch-test",
+            context="launch context",
+            codex_command=f"{sys.executable} {fake_codex}",
+            launcher="cli",
+        )
+        with self.assertRaises(guidance_map.GuidanceMapError):
+            guidance_map.attach_desktop_builder_thread(self.repo, str(result["build_id"]), "thread-123")
+
+        pid = int(result["pid"])
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        time.sleep(0.1)
+        guidance_map.finish_guidance_build(self.repo, str(result["build_id"]), "abandoned", force=True)
 
 
 @unittest.skipIf(shutil.which("git") is None, "git is not installed")

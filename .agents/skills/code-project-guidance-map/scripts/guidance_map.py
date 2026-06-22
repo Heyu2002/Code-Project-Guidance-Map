@@ -13,11 +13,15 @@ import json
 import os
 import re
 import secrets
+import shlex
+import shutil
 import subprocess
 import sys
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 
 START_MARKER = "<!-- code-project-guidance-map:start -->"
@@ -31,6 +35,17 @@ MODULE_END_MARKER = "<!-- code-project-guidance-map:module:end -->"
 SIGNATURE_SECRET_ENV = "CODE_PROJECT_GUIDANCE_MAP_SECRET"
 SIGNATURE_KEY_FILE_ENV = "CODE_PROJECT_GUIDANCE_MAP_KEY_FILE"
 SIGNATURE_KEY_HOME_ENV = "CODE_PROJECT_GUIDANCE_MAP_KEY_HOME"
+BUILD_HOME_ENV = "CODE_PROJECT_GUIDANCE_MAP_BUILD_HOME"
+BUILD_CODEX_COMMAND_ENV = "CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND"
+BUILD_CODEX_VALIDATE_ENV = "CODE_PROJECT_GUIDANCE_MAP_VALIDATE_CODEX"
+BUILD_LAUNCHER_ENV = "CODE_PROJECT_GUIDANCE_MAP_LAUNCHER"
+BUILD_DESKTOP_LAUNCH_GRACE_SECONDS_ENV = "CODE_PROJECT_GUIDANCE_MAP_DESKTOP_LAUNCH_GRACE_SECONDS"
+BUILD_STALE_SECONDS_ENV = "CODE_PROJECT_GUIDANCE_MAP_BUILD_STALE_SECONDS"
+BUILD_STATE_LOCK_TIMEOUT_ENV = "CODE_PROJECT_GUIDANCE_MAP_BUILD_STATE_LOCK_TIMEOUT"
+DEFAULT_BUILD_STALE_SECONDS = 6 * 60 * 60
+DEFAULT_DESKTOP_LAUNCH_GRACE_SECONDS = 10 * 60
+DEFAULT_BUILD_STATE_LOCK_TIMEOUT_SECONDS = 10.0
+BUILD_LAUNCH_GRACE_SECONDS = 60.0
 GENERATED_AT_RE = re.compile(r"^Generated at:\s*(?P<value>.+?)\s*$", re.MULTILINE)
 GENERATOR_RE = re.compile(r"^Generator:\s*(?P<value>.+?)\s*$", re.MULTILINE)
 GENERATOR_VERSION_RE = re.compile(r"^Generator version:\s*(?P<value>.+?)\s*$", re.MULTILINE)
@@ -154,6 +169,7 @@ GENERATED_GUIDANCE_PATTERNS = (
     "AGENTS.md",
     ".agents/guidance-map/**",
 )
+DETACHED_BUILDER_PROCESSES: list[subprocess.Popen[str]] = []
 
 
 class GuidanceMapError(RuntimeError):
@@ -457,6 +473,675 @@ def codex_home() -> Path:
     if configured:
         return Path(configured).expanduser()
     return Path.home() / ".codex"
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def safe_token(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip()) or "unknown"
+
+
+def build_home() -> Path:
+    configured = os.environ.get(BUILD_HOME_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    return codex_home() / "code-project-guidance-map" / "builds"
+
+
+def build_state_dir(repo: Path, git_available: bool) -> Path:
+    return build_home() / safe_token(project_id(repo, git_available))
+
+
+def build_state_path(state_dir: Path) -> Path:
+    return state_dir / "state-v1.json"
+
+
+def build_active_lock_path(state_dir: Path) -> Path:
+    return state_dir / "active-build.lock"
+
+
+def build_state_mutex_path(state_dir: Path) -> Path:
+    return state_dir / "state-write.lock"
+
+
+def read_json_file(path: Path) -> dict[str, Any]:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
+    tmp.replace(path)
+
+
+def read_build_state(state_dir: Path, repo: Path, git_available: bool) -> dict[str, Any]:
+    state = read_json_file(build_state_path(state_dir))
+    state.setdefault("version", 1)
+    state.setdefault("project_id", project_id(repo, git_available))
+    state.setdefault("repo_root", str(repo))
+    state.setdefault("pending_contexts", [])
+    state.setdefault("history", [])
+    if not isinstance(state["pending_contexts"], list):
+        state["pending_contexts"] = []
+    if not isinstance(state["history"], list):
+        state["history"] = []
+    return state
+
+
+def write_build_state(state_dir: Path, state: dict[str, Any]) -> None:
+    write_json_file(build_state_path(state_dir), state)
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def parse_timestamp_seconds(value: str | None) -> float | None:
+    parsed = parse_iso_datetime(value)
+    if parsed is None:
+        return None
+    return parsed.timestamp()
+
+
+def process_is_running(pid: int | None) -> bool:
+    if pid is None or pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except OSError:
+            return False
+        return result.returncode == 0 and str(pid) in result.stdout
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def active_build_is_live(active: dict[str, Any] | None) -> bool:
+    if not isinstance(active, dict):
+        return False
+    status_value = str(active.get("status") or "")
+    launcher = str(active.get("launcher") or "")
+    started_at = parse_timestamp_seconds(str(active.get("started_at") or ""))
+    age = (time.time() - started_at) if started_at is not None else None
+    if status_value == "launching" and age is not None and age < BUILD_LAUNCH_GRACE_SECONDS:
+        return True
+    if status_value == "desktop_launch_required" and age is not None:
+        desktop_launch_grace = env_float(BUILD_DESKTOP_LAUNCH_GRACE_SECONDS_ENV, float(DEFAULT_DESKTOP_LAUNCH_GRACE_SECONDS))
+        return age < desktop_launch_grace
+    pid_value = active.get("pid")
+    try:
+        pid = int(pid_value) if pid_value is not None else None
+    except (TypeError, ValueError):
+        pid = None
+    if process_is_running(pid):
+        return True
+    stale_after = env_float(BUILD_STALE_SECONDS_ENV, float(DEFAULT_BUILD_STALE_SECONDS))
+    if launcher == "desktop" and status_value == "running":
+        return bool(age is not None and age < stale_after and active.get("thread_id"))
+    return bool(age is not None and age < stale_after and status_value == "starting")
+
+
+def read_active_lock(state_dir: Path) -> dict[str, Any] | None:
+    loaded = read_json_file(build_active_lock_path(state_dir))
+    return loaded if loaded else None
+
+
+def write_active_lock(state_dir: Path, active: dict[str, Any]) -> None:
+    write_json_file(build_active_lock_path(state_dir), active)
+
+
+def remove_active_lock(state_dir: Path, build_id: str | None = None) -> None:
+    path = build_active_lock_path(state_dir)
+    if build_id:
+        existing = read_active_lock(state_dir)
+        if existing and existing.get("build_id") != build_id:
+            return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+class BuildStateMutex:
+    def __init__(self, state_dir: Path) -> None:
+        self.state_dir = state_dir
+        self.path = build_state_mutex_path(state_dir)
+        self.fd: int | None = None
+
+    def __enter__(self) -> "BuildStateMutex":
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        deadline = time.time() + env_float(BUILD_STATE_LOCK_TIMEOUT_ENV, DEFAULT_BUILD_STATE_LOCK_TIMEOUT_SECONDS)
+        while True:
+            try:
+                self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(self.fd, json.dumps({"pid": os.getpid(), "created_at": utc_now()}).encode("utf-8"))
+                return self
+            except FileExistsError:
+                try:
+                    age = time.time() - self.path.stat().st_mtime
+                except OSError:
+                    age = 0
+                if age > DEFAULT_BUILD_STATE_LOCK_TIMEOUT_SECONDS:
+                    try:
+                        self.path.unlink()
+                    except OSError:
+                        pass
+                    continue
+                if time.time() >= deadline:
+                    raise GuidanceMapError(f"Timed out waiting for build state lock: {self.path}")
+                time.sleep(0.1)
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+
+def append_history(state: dict[str, Any], active: dict[str, Any], status_value: str, message: str | None = None) -> None:
+    history = state.setdefault("history", [])
+    if not isinstance(history, list):
+        history = []
+        state["history"] = history
+    entry = dict(active)
+    entry["finished_at"] = utc_now()
+    entry["finish_status"] = status_value
+    if message:
+        entry["message"] = message
+    history.append(entry)
+    del history[:-20]
+
+
+def clear_active_build(state_dir: Path, state: dict[str, Any], status_value: str, message: str | None = None) -> None:
+    active = state.pop("active", None)
+    if isinstance(active, dict):
+        append_history(state, active, status_value, message)
+        remove_active_lock(state_dir, str(active.get("build_id") or ""))
+
+
+def ensure_active_from_lock(state_dir: Path, state: dict[str, Any]) -> dict[str, Any] | None:
+    active = state.get("active")
+    if isinstance(active, dict):
+        return active
+    lock = read_active_lock(state_dir)
+    if isinstance(lock, dict):
+        state["active"] = lock
+        return lock
+    return None
+
+
+def normalize_context_text(context: str | None, context_file: Path | None) -> str:
+    pieces: list[str] = []
+    if context:
+        pieces.append(context.strip())
+    if context_file:
+        try:
+            pieces.append(context_file.read_text(encoding="utf-8").strip())
+        except OSError as exc:
+            raise GuidanceMapError(f"Unable to read build context file {context_file}: {exc}") from exc
+    text = "\n\n".join(piece for piece in pieces if piece)
+    if len(text) > 60000:
+        return text[:60000] + "\n\n[context truncated by guidance_map.py build]"
+    return text
+
+
+def build_request_context(
+    repo: Path,
+    verification: dict[str, object],
+    reason: str | None,
+    context: str | None,
+    context_file: Path | None,
+) -> dict[str, Any]:
+    return {
+        "request_id": uuid.uuid4().hex,
+        "requested_at": utc_now(),
+        "repo_root": str(repo),
+        "reason": reason or str(verification.get("recommended_action") or "refresh"),
+        "context": normalize_context_text(context, context_file),
+        "recommended_action": verification.get("recommended_action"),
+        "severity": verification.get("severity"),
+        "changed_files": verification.get("changed_files"),
+        "affected_module_guides": verification.get("affected_module_guides"),
+        "reasons": verification.get("reasons"),
+    }
+
+
+def builder_prompt(
+    repo: Path,
+    build_id: str,
+    script_path: Path,
+    verification: dict[str, object],
+    request_context: dict[str, Any],
+    state_dir: Path,
+) -> str:
+    return f"""You are the script-coordinated Code Project Guidance Map builder agent.
+
+Repository: {repo}
+Build id: {build_id}
+Build state directory: {state_dir}
+
+This is the only mode allowed to construct or refresh the guidance map. Do not run `guidance_map.py build` and do not start another builder. Other Codex threads synchronize context through the build state while you own this lease.
+
+Your task:
+1. Read the local `code-project-guidance-map` skill instructions. Because this prompt was launched by `guidance_map.py build`, operate in Builder Agent Mode: perform the direct map construction workflow in this agent instead of delegating back to `build`.
+2. Run `python {script_path} status --repo {repo}` and `python {script_path} verify --repo {repo}`.
+3. If the guidance is current and no refresh was explicitly requested, release the lease with `python {script_path} build-finish --repo {repo} --build-id {build_id} --status complete`.
+4. For generate, full refresh, or incremental refresh work, use bounded module subagents exactly as the skill requires. The main builder owns only shallow scanning, macro module boundaries, index integration, and final helper commands.
+5. Write module guides, create the temporary index draft, then run `python {script_path} update --repo {repo} --guidance-file <temp-index.md>`.
+6. Validate with `python {script_path} status --repo {repo}`.
+7. Before finalizing, run `python {script_path} build-drain --repo {repo} --build-id {build_id}`. If it returns pending contexts, fold them into your working context, re-run `verify`, and perform another build pass. Repeat until `pending_contexts` is empty.
+8. Release the lease only after the final pass with `python {script_path} build-finish --repo {repo} --build-id {build_id} --status complete`. If you cannot complete, run the same command with `--status failed --message <reason>`.
+
+Initial verification JSON:
+```json
+{json.dumps(verification, ensure_ascii=False, indent=2)}
+```
+
+Initial request context:
+```json
+{json.dumps(request_context, ensure_ascii=False, indent=2)}
+```
+"""
+
+
+def desktop_codex_install_hint() -> str | None:
+    if os.name != "nt":
+        return None
+    try:
+        program_files = Path(os.environ.get("ProgramFiles") or r"C:\Program Files")
+        matches = sorted(program_files.glob(r"WindowsApps/OpenAI.Codex_*/app/resources/codex.exe"))
+    except OSError:
+        matches = []
+    if not matches:
+        return None
+    return str(matches[-1])
+
+
+def validate_default_codex(command: list[str]) -> None:
+    if os.environ.get(BUILD_CODEX_VALIDATE_ENV, "1").strip().casefold() in {"0", "false", "no", "off"}:
+        return
+    try:
+        result = subprocess.run(
+            [*command, "--version"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        hint = desktop_codex_install_hint()
+        desktop_note = (
+            f" A Codex Desktop package appears to be installed at {hint}, but that WindowsApps path may not be directly executable by scripts."
+            if hint
+            else ""
+        )
+        raise GuidanceMapError(
+            "Unable to run `codex --version` for the CLI launcher; use a runnable Codex CLI command on PATH, "
+            "CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND/--codex-command, or `guidance_map.py build --launcher auto` from Codex Desktop."
+            f"{desktop_note}"
+        ) from exc
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or result.stdout.strip()
+        raise GuidanceMapError(f"`codex --version` failed with code {result.returncode}: {stderr}")
+
+
+def resolve_codex_command(codex_command: str | None) -> list[str]:
+    configured = codex_command or os.environ.get(BUILD_CODEX_COMMAND_ENV)
+    if configured:
+        command = shlex.split(configured, posix=os.name != "nt")
+        if not command:
+            raise GuidanceMapError("Codex command is empty.")
+        return command
+
+    executable = shutil.which("codex")
+    if not executable:
+        hint = desktop_codex_install_hint()
+        desktop_note = (
+            f" A Codex Desktop package appears to be installed at {hint}, but no runnable `codex` command is exposed on PATH."
+            if hint
+            else ""
+        )
+        raise GuidanceMapError(
+            "Unable to find a runnable `codex` command for the CLI launcher. The build helper can use Codex CLI, including "
+            "a Desktop-provided command alias, or `guidance_map.py build --launcher auto` can hand off from Codex Desktop."
+            f"{desktop_note}"
+        )
+    command = [executable]
+    validate_default_codex(command)
+    return command
+
+
+def normalize_build_launcher(launcher: str | None) -> str:
+    value = (launcher or os.environ.get(BUILD_LAUNCHER_ENV) or "auto").strip().casefold()
+    if value not in {"auto", "cli", "desktop"}:
+        raise GuidanceMapError("Build launcher must be one of: auto, cli, desktop.")
+    return value
+
+
+def desktop_launcher_available() -> bool:
+    return os.environ.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "").strip().casefold() == "codex desktop"
+
+
+def resolve_build_launcher(launcher: str | None, codex_command: str | None) -> tuple[str, list[str] | None, str | None]:
+    launcher_value = normalize_build_launcher(launcher)
+    explicit_command = bool(codex_command or os.environ.get(BUILD_CODEX_COMMAND_ENV))
+    if launcher_value == "desktop":
+        if not desktop_launcher_available():
+            return "desktop", None, "Desktop launcher was requested; create_thread must be available in the current Codex app thread."
+        return "desktop", None, None
+
+    try:
+        return "cli", resolve_codex_command(codex_command), None
+    except GuidanceMapError as exc:
+        if launcher_value == "auto" and not explicit_command and desktop_launcher_available():
+            return "desktop", None, str(exc)
+        raise
+
+
+def launch_builder_agent(
+    repo: Path,
+    build_id: str,
+    prompt: str,
+    state_dir: Path,
+    codex_command: str | None,
+    model: str | None,
+    extra_args: list[str],
+    resolved_command: list[str] | None = None,
+) -> dict[str, Any]:
+    command = resolved_command or resolve_codex_command(codex_command)
+
+    log_dir = state_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    prompt_file = log_dir / f"{build_id}.prompt.md"
+    log_file = log_dir / f"{build_id}.jsonl"
+    last_message_file = log_dir / f"{build_id}.last-message.md"
+    write_text(prompt_file, prompt)
+
+    cmd = [
+        *command,
+        "exec",
+        "--cd",
+        str(repo),
+        "--json",
+        "-o",
+        str(last_message_file),
+    ]
+    if model:
+        cmd.extend(["--model", model])
+    cmd.extend(extra_args)
+    cmd.append("-")
+
+    env = os.environ.copy()
+    env["CODE_PROJECT_GUIDANCE_MAP_BUILD_ID"] = build_id
+    env["CODE_PROJECT_GUIDANCE_MAP_BUILD_STATE_DIR"] = str(state_dir)
+    creationflags = 0
+    start_new_session = os.name != "nt"
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+    log_handle = log_file.open("a", encoding="utf-8")
+    try:
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(repo),
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=start_new_session,
+            creationflags=creationflags,
+        )
+        assert process.stdin is not None
+        process.stdin.write(prompt)
+        process.stdin.close()
+        time.sleep(0.2)
+        if process.poll() is not None:
+            raise GuidanceMapError(f"Builder agent exited during startup with code {process.returncode}. See {log_file}.")
+        DETACHED_BUILDER_PROCESSES.append(process)
+        return {
+            "pid": process.pid,
+            "command": cmd,
+            "prompt_file": str(prompt_file),
+            "log_file": str(log_file),
+            "last_message_file": str(last_message_file),
+        }
+    except OSError as exc:
+        raise GuidanceMapError(f"Unable to launch builder agent: {exc}") from exc
+    finally:
+        log_handle.close()
+def start_guidance_build(
+    repo_arg: Path,
+    reason: str | None = None,
+    context: str | None = None,
+    context_file: Path | None = None,
+    codex_command: str | None = None,
+    model: str | None = None,
+    extra_args: list[str] | None = None,
+    launcher: str | None = None,
+) -> dict[str, Any]:
+    root, git_available = repo_root(repo_arg)
+    verification = verify(root)
+    state_dir = build_state_dir(root, git_available)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    request_context = build_request_context(root, verification, reason, context, context_file)
+    script_path = Path(__file__).resolve()
+
+    with BuildStateMutex(state_dir):
+        state = read_build_state(state_dir, root, git_available)
+        active = ensure_active_from_lock(state_dir, state)
+        if active_build_is_live(active):
+            pending = state.setdefault("pending_contexts", [])
+            pending.append(request_context)
+            write_build_state(state_dir, state)
+            return {
+                "status": "queued",
+                "repo_root": str(root),
+                "project_id": project_id(root, git_available),
+                "active_build_id": active.get("build_id") if isinstance(active, dict) else None,
+                "pending_context_count": len(pending),
+                "state_file": str(build_state_path(state_dir)),
+                "message": "A guidance-map builder is already running; context was synchronized for the active builder to consume before it finishes.",
+            }
+
+        if active:
+            clear_active_build(state_dir, state, "stale", "Active builder was not running; replacing stale lease.")
+
+        launcher_value, resolved_command, launcher_note = resolve_build_launcher(launcher, codex_command)
+        build_id = uuid.uuid4().hex
+        started_at = utc_now()
+        prompt = builder_prompt(root, build_id, script_path, verification, request_context, state_dir)
+        active = {
+            "build_id": build_id,
+            "repo_root": str(root),
+            "project_id": project_id(root, git_available),
+            "status": "launching" if launcher_value == "cli" else "desktop_launch_required",
+            "launcher": launcher_value,
+            "started_at": started_at,
+            "pid": None,
+        }
+        state["active"] = active
+        state.setdefault("pending_contexts", [])
+        write_active_lock(state_dir, active)
+        write_build_state(state_dir, state)
+
+        if launcher_value == "desktop":
+            log_dir = state_dir / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            prompt_file = log_dir / f"{build_id}.prompt.md"
+            write_text(prompt_file, prompt)
+            active["prompt_file"] = str(prompt_file)
+            if launcher_note:
+                active["launcher_note"] = launcher_note
+            write_active_lock(state_dir, active)
+            write_build_state(state_dir, state)
+            return {
+                "status": "desktop_launch_required",
+                "repo_root": str(root),
+                "project_id": project_id(root, git_available),
+                "build_id": build_id,
+                "launcher": "desktop",
+                "state_file": str(build_state_path(state_dir)),
+                "prompt_file": str(prompt_file),
+                "prompt": prompt,
+                "attach_command": f"python {script_path} build-attach --repo {root} --build-id {build_id} --thread-id <created-thread-id>",
+                "finish_failed_command": f"python {script_path} build-finish --repo {root} --build-id {build_id} --status failed --force --message <reason>",
+                "message": (
+                    "No runnable CLI builder was launched. In Codex Desktop, create a new local project thread with the returned prompt, "
+                    "then run build-attach with the created thread id. The lease prevents another map builder from starting meanwhile."
+                ),
+            }
+
+        try:
+            launch = launch_builder_agent(
+                root,
+                build_id,
+                prompt,
+                state_dir,
+                codex_command,
+                model,
+                extra_args or [],
+                resolved_command=resolved_command,
+            )
+        except GuidanceMapError:
+            clear_active_build(state_dir, state, "launch_failed", "Builder agent failed to start.")
+            write_build_state(state_dir, state)
+            raise
+
+        active.update(
+            {
+                "status": "running",
+                "launcher": "cli",
+                "pid": launch["pid"],
+                "command": launch["command"],
+                "prompt_file": launch["prompt_file"],
+                "log_file": launch["log_file"],
+                "last_message_file": launch["last_message_file"],
+            }
+        )
+        write_active_lock(state_dir, active)
+        write_build_state(state_dir, state)
+        return {
+            "status": "started",
+            "repo_root": str(root),
+            "project_id": project_id(root, git_available),
+            "build_id": build_id,
+            "launcher": "cli",
+            "pid": launch["pid"],
+            "state_file": str(build_state_path(state_dir)),
+            "prompt_file": launch["prompt_file"],
+            "log_file": launch["log_file"],
+            "last_message_file": launch["last_message_file"],
+            "message": "Builder agent started; guidance_map.py build is exiting now.",
+        }
+
+
+def attach_desktop_builder_thread(repo_arg: Path, build_id: str, thread_id: str) -> dict[str, Any]:
+    root, git_available = repo_root(repo_arg)
+    state_dir = build_state_dir(root, git_available)
+    with BuildStateMutex(state_dir):
+        state = read_build_state(state_dir, root, git_available)
+        active = ensure_active_from_lock(state_dir, state)
+        if not isinstance(active, dict) or active.get("build_id") != build_id:
+            raise GuidanceMapError("Build id does not match the active guidance-map builder.")
+        if str(active.get("launcher") or "") != "desktop":
+            raise GuidanceMapError("Active builder was not prepared for Desktop thread attachment.")
+        active.update(
+            {
+                "status": "running",
+                "thread_id": thread_id,
+                "attached_at": utc_now(),
+            }
+        )
+        state["active"] = active
+        write_active_lock(state_dir, active)
+        write_build_state(state_dir, state)
+        return {
+            "status": "attached",
+            "repo_root": str(root),
+            "build_id": build_id,
+            "thread_id": thread_id,
+            "state_file": str(build_state_path(state_dir)),
+            "message": "Desktop builder thread attached; guidance_map.py build coordination can stop in the caller thread.",
+        }
+
+
+def drain_build_context(repo_arg: Path, build_id: str) -> dict[str, Any]:
+    root, git_available = repo_root(repo_arg)
+    state_dir = build_state_dir(root, git_available)
+    with BuildStateMutex(state_dir):
+        state = read_build_state(state_dir, root, git_available)
+        active = ensure_active_from_lock(state_dir, state)
+        if not isinstance(active, dict) or active.get("build_id") != build_id:
+            raise GuidanceMapError("Build id does not match the active guidance-map builder.")
+        pending = state.get("pending_contexts") if isinstance(state.get("pending_contexts"), list) else []
+        state["pending_contexts"] = []
+        write_build_state(state_dir, state)
+        return {
+            "status": "drained",
+            "repo_root": str(root),
+            "build_id": build_id,
+            "pending_contexts": pending,
+            "pending_context_count": len(pending),
+            "state_file": str(build_state_path(state_dir)),
+        }
+
+
+def finish_guidance_build(
+    repo_arg: Path,
+    build_id: str,
+    status_value: str,
+    message: str | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    root, git_available = repo_root(repo_arg)
+    state_dir = build_state_dir(root, git_available)
+    with BuildStateMutex(state_dir):
+        state = read_build_state(state_dir, root, git_available)
+        active = ensure_active_from_lock(state_dir, state)
+        if not isinstance(active, dict) or active.get("build_id") != build_id:
+            raise GuidanceMapError("Build id does not match the active guidance-map builder.")
+        pending = state.get("pending_contexts") if isinstance(state.get("pending_contexts"), list) else []
+        if pending and not force:
+            raise GuidanceMapError("Pending build context exists; run build-drain and perform another build pass before finishing.")
+        clear_active_build(state_dir, state, status_value, message)
+        write_build_state(state_dir, state)
+        return {
+            "status": "finished",
+            "finish_status": status_value,
+            "repo_root": str(root),
+            "build_id": build_id,
+            "pending_context_count": len(pending),
+            "state_file": str(build_state_path(state_dir)),
+        }
 
 
 def signature_key_path(key_id: str) -> Path:
@@ -1404,14 +2089,73 @@ def main() -> int:
     update_parser.add_argument("--guidance-file", required=True, help="Markdown file containing the project index draft.")
     update_parser.add_argument("--timestamp", help="ISO-8601 timestamp override for tests.")
 
+    build_parser = subparsers.add_parser("build", help="Start or coordinate the single guidance-map builder agent.")
+    build_parser.add_argument("--repo", default=".", help="Repository or project directory.")
+    build_parser.add_argument("--reason", help="Short reason for this build request.")
+    build_parser.add_argument("--context", help="Context to synchronize into the builder request.")
+    build_parser.add_argument("--context-file", type=Path, help="File containing context to synchronize into the builder request.")
+    build_parser.add_argument("--codex-command", help="Command used to launch Codex; defaults to `codex`.")
+    build_parser.add_argument(
+        "--launcher",
+        choices=("auto", "cli", "desktop"),
+        default=None,
+        help="Builder launcher. auto uses CLI when available and Desktop handoff from Codex Desktop otherwise.",
+    )
+    build_parser.add_argument("--model", help="Optional model passed through to `codex exec`.")
+    build_parser.add_argument(
+        "--agent-arg",
+        action="append",
+        default=[],
+        help="Additional argument passed through to `codex exec`; repeat for multiple arguments.",
+    )
+
+    attach_parser = subparsers.add_parser("build-attach", help="Attach a Codex Desktop-created builder thread to a build lease.")
+    attach_parser.add_argument("--repo", default=".", help="Repository or project directory.")
+    attach_parser.add_argument("--build-id", required=True, help="Active build id.")
+    attach_parser.add_argument("--thread-id", required=True, help="Created Codex Desktop thread id.")
+
+    drain_parser = subparsers.add_parser("build-drain", help="Drain pending build contexts for the active builder.")
+    drain_parser.add_argument("--repo", default=".", help="Repository or project directory.")
+    drain_parser.add_argument("--build-id", required=True, help="Active build id.")
+
+    finish_parser = subparsers.add_parser("build-finish", help="Release the active guidance-map builder lease.")
+    finish_parser.add_argument("--repo", default=".", help="Repository or project directory.")
+    finish_parser.add_argument("--build-id", required=True, help="Active build id.")
+    finish_parser.add_argument("--status", choices=("complete", "failed", "abandoned"), required=True)
+    finish_parser.add_argument("--message", help="Optional finish message.")
+    finish_parser.add_argument("--force", action="store_true", help="Release even when pending contexts exist.")
+
     args = parser.parse_args()
     try:
         if args.command == "status":
             output = status(Path(args.repo))
         elif args.command == "verify":
             output = verify(Path(args.repo))
-        else:
+        elif args.command == "update":
             output = update(Path(args.repo), Path(args.guidance_file), args.timestamp)
+        elif args.command == "build":
+            output = start_guidance_build(
+                Path(args.repo),
+                reason=args.reason,
+                context=args.context,
+                context_file=args.context_file,
+                codex_command=args.codex_command,
+                model=args.model,
+                extra_args=args.agent_arg,
+                launcher=args.launcher,
+            )
+        elif args.command == "build-attach":
+            output = attach_desktop_builder_thread(Path(args.repo), args.build_id, args.thread_id)
+        elif args.command == "build-drain":
+            output = drain_build_context(Path(args.repo), args.build_id)
+        else:
+            output = finish_guidance_build(
+                Path(args.repo),
+                args.build_id,
+                args.status,
+                message=args.message,
+                force=args.force,
+            )
     except GuidanceMapError as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2

@@ -20,7 +20,9 @@ When invoked in a target repository, the skill will:
 
 - Check whether the repository root has `AGENTS.md` and this plugin's marker block.
 - Ask before first generation unless the user already explicitly requested it.
-- Let the main agent decide the macro module map from shallow repository signals.
+- Start or coordinate one Codex builder thread per repository through `guidance_map.py build`.
+- Synchronize later build requests into the active builder instead of allowing concurrent map construction.
+- Let the builder agent decide the macro module map from shallow repository signals.
 - Require bounded module subagents to read module internals and write one module guide file per module.
 - Keep `AGENTS.md` as a compact project index: global editing rules, task routing, dependency rules, and module links.
 - Store module-specific structure, entry points, and local rules in `.agents/guidance-map/modules/*.md`.
@@ -28,7 +30,7 @@ When invoked in a target repository, the skill will:
 - Sign the aggregate `AGENTS.md` index so manual edits or broken module links are detectable.
 - Incrementally refresh affected module guides from Git changes instead of rereading the whole project.
 - Capture a signed local-change baseline during refresh so dirty worktree files do not repeatedly trigger stale guidance until their content changes again.
-- Run lightweight hooks on `SessionStart`, `UserPromptSubmit`, and `Stop` to detect stale, missing, or unverifiable guidance before code edits and after a task ends.
+- Run lightweight hooks on `SessionStart`, `UserPromptSubmit`, and `Stop` to detect stale, missing, or unverifiable guidance and route refreshes through the single-builder helper.
 
 The fixed `AGENTS.md` marker block is:
 
@@ -80,21 +82,23 @@ codex plugin add code-project-guidance-map@code-project-guidance-map
 After installation, open a new Codex thread in the project you want to map and invoke:
 
 ```text
-Use $code-project-guidance-map to create or refresh this repository's signed AGENTS.md project index and per-module guide files. First decide macro module boundaries from shallow repo signals, then spawn bounded module subagents to create or refresh `.agents/guidance-map/modules/*.md`, then use the helper to sign module guides, link them from AGENTS.md, and sign the aggregate index. Do not do module-internal reading in the main thread.
+Use $code-project-guidance-map to refresh the signed AGENTS.md guidance map via its single builder.
 ```
+
+The build helper uses `guidance_map.py build --launcher auto`. Pure CLI users are launched through `codex exec`, using a runnable `codex` command on PATH or `CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND` / `--codex-command`. Pure Codex Desktop users do not need a separate CLI install: the helper claims the single build lease, returns a Desktop builder prompt, and the current Desktop thread creates a new local project thread with that prompt, then records the created thread id with `build-attach`.
 
 ## Usage
 
 Generate the guide when Codex first joins a project:
 
 ```text
-Use $code-project-guidance-map to create this repository's signed AGENTS.md project index and per-module guide files.
+Use $code-project-guidance-map to request creation of this repository's signed AGENTS.md project index and per-module guide files through the helper build command.
 ```
 
 Refresh after meaningful structure changes:
 
 ```text
-Use $code-project-guidance-map to refresh the project guidance from recent Git changes, updating only affected module guide files when possible.
+Use $code-project-guidance-map to queue a project guidance refresh from recent Git changes through the single builder.
 ```
 
 Use the guide before larger feature work:
@@ -114,9 +118,9 @@ Module index entries can include optional lazy-read hints:
 - Usually skip when: Only changing helper signing, README copy, or plugin marketplace metadata.
 ```
 
-Hooks are read-only. They verify the current repository's guidance and add bounded context when the index or module guides are missing, stale, or unverifiable. Hook messages are state-machine driven: state is stored in the user's Codex home, but debounce decisions are scoped by project and session so one stale project does not silence another. By default, the same project/session/action is only reported once. After a code-edit-like prompt, `Stop` emits a continuation system message that tells Codex to refresh affected guidance immediately before finalizing, rather than leaving the refresh as a reminder for a later task. Set `CODE_PROJECT_GUIDANCE_MAP_HOOK_LEVEL=off|error|stale|all` to tune hook noise.
+Hooks are read-only. They verify the current repository's guidance and add bounded context when the index or module guides are missing, stale, or unverifiable. Hook messages are state-machine driven: state is stored in the user's Codex home, but debounce decisions are scoped by project and session so one stale project does not silence another. By default, the same project/session/action is only reported once. After a code-edit-like prompt, `Stop` emits a continuation system message that tells Codex to call `guidance_map.py build --launcher auto` before finalizing. The helper either starts the single builder agent, prepares a Desktop builder thread handoff, or synchronizes the current thread context into the already active builder. Set `CODE_PROJECT_GUIDANCE_MAP_HOOK_LEVEL=off|error|stale|all` to tune hook noise.
 
-Subagents are mandatory for generation and refresh. Module subagents write their assigned module guide files directly. The main agent owns only the macro module map and the compact `AGENTS.md` index draft, then runs the helper to sign module files, backfill module signatures into the index, and write the aggregate signed `AGENTS.md` block. If coding changes make guidance stale, Codex should run the affected-module refresh immediately before the final response. If subagents are unavailable, the skill falls back to `plan-only`: it outputs the macro module map, affected files, bounded subagent scopes, and follow-up command, but does not read module internals or write guidance files.
+Subagents are mandatory for generation and refresh, but only inside the script-coordinated builder agent. Ordinary threads must not construct the map directly; they call `guidance_map.py build --launcher auto` and stop once the request is started, queued, or handed off to a Desktop-created builder thread. Module subagents write their assigned module guide files directly. The builder agent owns only the macro module map and the compact `AGENTS.md` index draft, then runs the helper to sign module files, backfill module signatures into the index, and write the aggregate signed `AGENTS.md` block. If coding changes make guidance stale, Codex should call the build helper immediately before the final response. If builder subagents are unavailable, the builder falls back to `plan-only`: it outputs the macro module map, affected files, bounded subagent scopes, and follow-up command, but does not read module internals or write guidance files.
 
 ## Result
 

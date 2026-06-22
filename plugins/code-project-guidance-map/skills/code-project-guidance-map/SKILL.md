@@ -1,6 +1,6 @@
 ---
 name: code-project-guidance-map
-description: Create or refresh a structured AGENTS.md project action index plus signed per-module Markdown guides. Use when the user asks Codex to read a project, map code structure, document module ownership, clarify module dependency boundaries, initialize project guidance, refresh an AGENTS.md project guide, or keep concise project editing guidance up to date from Git changes. When invoked, the main agent must decide macro module boundaries first, then use mandatory bounded subagents to create or refresh individual module guide files; do not perform project-wide or module-internal reading in the main thread.
+description: Create or refresh a structured AGENTS.md project action index plus signed per-module Markdown guides. Use when the user asks Codex to read a project, map code structure, document module ownership, clarify module dependency boundaries, initialize project guidance, refresh an AGENTS.md project guide, or keep concise project editing guidance up to date from Git changes. Ordinary invocations must run the helper `build` command so a single script-coordinated Codex builder thread owns map construction; only that builder may perform the direct macro-map, bounded-subagent, and signing workflow.
 ---
 
 # Code Project Guidance Map
@@ -13,7 +13,9 @@ Create or refresh the `code-project-guidance-map` block in the repository root `
 
 The module guides contain the module-specific detail. They are lazy context, not startup context: later agents should read a module guide only when the task routing, changed files, `verify.affected_modules`, or module index fields indicate that module is relevant. Each module guide has its own signature block. The `AGENTS.md` index records each module guide path and module signature, then gets its own aggregate signature.
 
-This skill must protect the main thread context. The main agent may do shallow repository scanning, macro module planning, index integration, and the final helper command, but module-internal reading and module-guide writing must run in subagents.
+This skill must protect the main thread context and enforce a single construction owner. Ordinary Codex threads must not construct or refresh the map directly. They must hand off to `guidance_map.py build`, which creates or coordinates one Codex builder thread and exits after the builder is running or the request has been queued. If another builder is already active, the script records the new request context for that active builder; it must not start a second builder.
+
+The script-coordinated builder may do shallow repository scanning, macro module planning, index integration, and the final helper command, but module-internal reading and module-guide writing must still run in bounded module subagents.
 
 ## Markers
 
@@ -33,7 +35,28 @@ Module guide files use these exact module signature markers:
 
 Do not rewrite user-authored content outside the `AGENTS.md` marker block. Do not manually edit signature blocks; use the helper.
 
-## Workflow
+## Entry Mode Gate
+
+First determine whether this agent is the script-coordinated builder.
+
+- If the prompt includes a build id from `guidance_map.py build` and says this is the script-coordinated Code Project Guidance Map builder agent, continue to `Builder Agent Workflow` below. Do not call `guidance_map.py build` again.
+- Otherwise, do not inspect module internals, decide module boundaries, spawn module subagents, write guide files, or run `guidance_map.py update`. Locate the repository root and run:
+
+```bash
+python <skill-dir>/scripts/guidance_map.py build --repo <repo-root> --launcher auto --context "<brief current user request and any relevant thread context>"
+```
+
+- If the command returns `status: started`, report that the CLI-launched builder agent was launched and stop this thread's map work.
+- If the command returns `status: queued`, report that another builder is already running and that this thread's context was synchronized for the active builder to consume before it finishes.
+- If the command returns `status: desktop_launch_required`, this is the Desktop-only path. Use the Codex Desktop thread creation tool to create a new local project thread with the returned `prompt`, then run the returned `attach_command` with the created thread id. If thread creation fails, run the returned `finish_failed_command` with an explanatory message. After attach succeeds, report that the Desktop builder thread was launched and stop this thread's map work.
+- If the command fails because `codex` is unavailable or cannot be started and no Desktop thread creation tool is available, report the failure. Do not fall back to direct construction in the current thread.
+
+Launcher behavior:
+
+- Pure CLI users are supported by `--launcher auto` or `--launcher cli`; the helper starts the builder with `codex exec`. It needs a runnable `codex` command on PATH, or `CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND` / `--codex-command` pointing at one.
+- Pure Codex Desktop users are supported by `--launcher auto` or `--launcher desktop`; the helper creates the single build lease and returns a Desktop builder prompt, and the current Desktop thread must call the app's thread creation tool. This path does not require a separate CLI install.
+
+## Builder Agent Workflow
 
 1. Locate the repository root.
    - Prefer `git rev-parse --show-toplevel`.
@@ -72,14 +95,14 @@ python <skill-dir>/scripts/guidance_map.py verify --repo <repo-root>
    - `incremental_refresh`: `verify.recommended_action` is `refresh_dependency_rules`, `refresh_task_routing_and_affected_modules`, `refresh_affected_modules`, or `review_changed_files`.
    - `plan-only`: a safe fallback when `run_mode` would otherwise be `generate`, `full_refresh`, or `incremental_refresh`, but no subagent/delegation tool is available.
    - For `generate`, `full_refresh`, and `incremental_refresh`, module subagents are mandatory.
-   - If no subagent/delegation tool is available for any non-`no-op` run mode, switch to `plan-only`; do not fall back to main-thread module-internal source reading.
+   - If no subagent/delegation tool is available for any non-`no-op` run mode, switch to `plan-only`; do not fall back to builder-thread module-internal source reading.
    - In `plan-only`, output only the proposed macro module map, affected changed files, bounded subagent scopes, and the exact follow-up `$code-project-guidance-map` request needed to perform the refresh when subagents are available.
    - In `plan-only`, do not write `AGENTS.md`, do not create or update module guide files, do not run `guidance_map.py update`, and do not read module internals.
 
 6. Decide the macro module map before delegation.
-   - The main agent owns the global module map: choose concise module names, group paths into modules, decide whether the run is full or incremental, and define bounded scopes for subagents.
-   - Allowed in the main thread before delegation: file listing, top-level directory inspection, root build/package manifests, existing `AGENTS.md` index, `verify` JSON, module guide paths, and names of known packages/modules.
-   - Not allowed in the main thread: opening source files across modules to infer internals, recursive implementation reading, broad import tracing, or writing module summaries from source content.
+   - The builder agent owns the global module map: choose concise module names, group paths into modules, decide whether the run is full or incremental, and define bounded scopes for subagents.
+   - Allowed in the builder thread before delegation: file listing, top-level directory inspection, root build/package manifests, existing `AGENTS.md` index, `verify` JSON, module guide paths, and names of known packages/modules.
+   - Not allowed in the builder thread: opening source files across modules to infer internals, recursive implementation reading, broad import tracing, or writing module summaries from source content.
    - Do not spawn module subagents until the draft macro map exists.
    - Do not delegate the global module-boundary decision.
    - Let the actual code structure drive module boundaries. Do not force a top-level-only or all-directories scheme.
@@ -91,6 +114,7 @@ python <skill-dir>/scripts/guidance_map.py verify --repo <repo-root>
    - Each module subagent must create or update only its assigned module guide file, normally under `.agents/guidance-map/modules/<module-slug>.md`.
    - Module subagents must not decide global module boundaries and must not edit unrelated module guide files.
    - Module subagents may update their own module index entry draft or return it, but the final `AGENTS.md` write must go through the helper so signatures stay consistent.
+   - Do not start another project-map builder from a module subagent.
 
 8. Write the project index draft in a temporary file.
    - The index draft is the content that will appear inside the `AGENTS.md` marker block after metadata/signature lines.
@@ -147,6 +171,22 @@ python <skill-dir>/scripts/guidance_map.py update --repo <repo-root> --guidance-
 ```
 
 The helper creates `AGENTS.md` if needed, appends the block if missing, replaces only the marker block if present, signs each module guide file, writes each module signature back into `### Module Index`, and signs the aggregate `AGENTS.md` index.
+
+11. Before finalizing, drain synchronized context from other threads:
+
+```bash
+python <skill-dir>/scripts/guidance_map.py build-drain --repo <repo-root> --build-id <build-id>
+```
+
+If the command returns pending contexts, fold them into the current build context, re-run `verify`, and perform another build pass. Repeat until the pending context list is empty.
+
+12. Release the builder lease:
+
+```bash
+python <skill-dir>/scripts/guidance_map.py build-finish --repo <repo-root> --build-id <build-id> --status complete
+```
+
+If the build cannot complete, release with `--status failed --message <reason>`. Do not leave an active lease behind.
 
 ## Output Format
 
@@ -222,7 +262,7 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 
 - Treat the script's `verify.changed_files`, `change_impact`, `modules`, and `recommended_action` as the update scope.
 - Treat `Local change baseline` as the dirty-worktree freshness boundary: a file that was already dirty during the last refresh should not trigger another refresh until its content changes again.
-- Use module subagents for affected-module rereads and module guide rewrites.
+- In the script-coordinated builder agent, use module subagents for affected-module rereads and module guide rewrites.
 - Do not re-evaluate `Agent Editing Rules` or `Module Dependency Rules` for ordinary module-internal changes.
 - Re-evaluate project-level rules only when `change_impact.boundary_rules` is non-empty or index metadata/signature/format/version is invalid.
 - Refresh task-routing guidance when `change_impact.task_routing` is non-empty.
@@ -237,15 +277,17 @@ Signature: hmac-sha256:<64 lowercase hex chars>
   - build/package manifests changed in ways that alter module boundaries;
   - the existing index is too stale to safely patch incrementally.
 - Do a module-level refresh when only one or more module guide signatures are invalid, missing, or affected by local source changes.
-- After a coding task changes files and `verify.recommended_action` is `refresh_dependency_rules`, `refresh_task_routing_and_affected_modules`, or `refresh_affected_modules`, refresh the affected guidance immediately before the final response. Do not leave it as a reminder for the next task.
-- If that immediate post-edit refresh is required but subagents are unavailable, switch to `plan-only` and report the bounded refresh plan instead of silently skipping the guidance update.
+- After a coding task changes files and `verify.recommended_action` is `refresh_dependency_rules`, `refresh_task_routing_and_affected_modules`, or `refresh_affected_modules`, the current thread must invoke `guidance_map.py build --launcher auto` before final response so the script-coordinated builder handles the refresh. Do not refresh directly in the current thread.
+- If the script-coordinated builder cannot use subagents, it must switch to `plan-only` and report the bounded refresh plan instead of silently skipping the guidance update.
 
 ## Safety Rules
 
 - Never edit target project files other than `AGENTS.md` and `.agents/guidance-map/modules/*.md` unless the user explicitly asks.
+- Never construct or refresh the map directly from an ordinary Codex thread. Ordinary threads must use `guidance_map.py build --launcher auto` and stop after the request is started, queued, or handed off to a Desktop-created builder thread.
+- Never run more than one project-map builder for the same repository. If a builder is active, synchronize context into that builder through `guidance_map.py build`.
 - Never remove user-authored `AGENTS.md` content outside the marker block.
-- Never perform project-wide or module-internal full reads in the main thread. Use bounded module subagents.
-- If subagents are unavailable and `run_mode` is not `no-op`, switch to `plan-only` and output the bounded refresh plan without reading module internals or writing guidance files.
+- Never perform project-wide or module-internal full reads in the builder thread. Use bounded module subagents.
+- If subagents are unavailable and `run_mode` is not `no-op`, the script-coordinated builder must switch to `plan-only` and output the bounded refresh plan without reading module internals or writing guidance files.
 - Treat generated signature blocks as plugin-owned. Manual edits invalidate signatures and require a plugin refresh.
 - If marker structure is malformed, stop and report the issue instead of guessing.
 - Do not include secrets, credentials, or private environment details in `AGENTS.md` or module guides.
@@ -259,3 +301,4 @@ After updating a guide:
 1. Re-run `status` to confirm `has_block` is true, `signature_valid` is true, and `modules_valid` is true.
 2. Verify `AGENTS.md` still contains any pre-existing content outside the marker block.
 3. Summarize whether the run was full or incremental, which module subagents were used, how many module guide files were written, and which changed files drove an incremental update.
+4. Run `build-drain` until no pending contexts remain, then run `build-finish` to release the single-builder lease.

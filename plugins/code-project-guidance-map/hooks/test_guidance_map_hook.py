@@ -130,8 +130,8 @@ class GuidanceMapHookTests(unittest.TestCase):
         self.assertIsNotNone(output)
         context = output["hookSpecificOutput"]["additionalContext"]  # type: ignore[index]
         self.assertIn("AGENTS.md project index or module guides are stale, missing", context)
-        self.assertIn("$code-project-guidance-map", context)
-        self.assertIn("bounded module subagents", context)
+        self.assertIn("helper build command", context)
+        self.assertIn("single script-coordinated builder agent", context)
 
     def test_repeated_same_session_action_is_suppressed(self) -> None:
         payload = {
@@ -246,9 +246,9 @@ class GuidanceMapHookTests(unittest.TestCase):
         self.assertIsNotNone(output)
         context = output["hookSpecificOutput"]["additionalContext"]  # type: ignore[index]
         self.assertIn("this looks like a code-edit request", context)
-        self.assertIn("$code-project-guidance-map", context)
+        self.assertIn("helper build command", context)
         self.assertIn("signed project index", context)
-        self.assertIn("bounded module subagents", context)
+        self.assertIn("single script-coordinated builder agent", context)
 
     def test_user_prompt_submit_injects_context_for_chinese_code_edit(self) -> None:
         result = self.run_hook(
@@ -311,9 +311,9 @@ class GuidanceMapHookTests(unittest.TestCase):
         self.assertIsNotNone(output)
         context = output["systemMessage"]  # type: ignore[index]
         self.assertIn("continue this task before finalizing", context)
-        self.assertIn("Run $code-project-guidance-map now", context)
-        self.assertIn("plan-only", context)
-        self.assertIn("$code-project-guidance-map", context)
+        self.assertIn("Run the helper build command now", context)
+        self.assertIn("single script-coordinated builder agent", context)
+        self.assertIn("queue this context", context)
         self.assertNotIn("hookSpecificOutput", output)
         self.assertIsNone(self.parse_hook_output(self.run_hook(stop_payload)))
 

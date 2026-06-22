@@ -1,4 +1,4 @@
 interface:
   display_name: "Code Project Guidance Map"
   short_description: "Create signed AGENTS.md indexes and module guides"
-  default_prompt: "Use $code-project-guidance-map to create or refresh this repository's signed AGENTS.md project index and per-module guide files. First decide macro module boundaries from shallow repo signals, then spawn bounded module subagents to create or refresh `.agents/guidance-map/modules/*.md`, then use the helper to sign module guides, link them from AGENTS.md, and sign the aggregate index. Do not do module-internal reading in the main thread."
+  default_prompt: "Use $code-project-guidance-map to refresh the signed AGENTS.md guidance map via its single builder."

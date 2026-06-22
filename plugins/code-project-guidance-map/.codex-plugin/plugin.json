@@ -16,7 +16,7 @@
   "interface": {
     "displayName": "Code Project Guidance Map",
     "shortDescription": "Create signed AGENTS.md indexes and module guides.",
-    "longDescription": "Builds and refreshes a marker-delimited AGENTS.md project index plus signed per-module Markdown guide files under .agents/guidance-map/modules. AGENTS.md stays compact with editing rules, task routing, dependency rules, and module links; module internals live in separate signed files so broken module signatures can be repaired module-by-module. Lightweight hooks verify guidance freshness on session start, code-edit prompts, and task stop, adding bounded Codex context or an end-of-task system message when refresh is recommended. The main agent decides macro module boundaries from shallow repo signals, while mandatory module subagents inspect module internals and write their assigned module guide files.",
+    "longDescription": "Builds and refreshes a marker-delimited AGENTS.md project index plus signed per-module Markdown guide files under .agents/guidance-map/modules. AGENTS.md stays compact with editing rules, task routing, dependency rules, and module links; module internals live in separate signed files so broken module signatures can be repaired module-by-module. Lightweight hooks verify guidance freshness on session start, code-edit prompts, and task stop, adding bounded Codex context or an end-of-task system message when refresh is recommended. Ordinary threads request refreshes through the helper build command; the helper enforces one active script-coordinated Codex builder thread per repository, synchronizes later request context into that builder, and prevents multiple threads from constructing the same map concurrently. CLI users are launched through `codex exec`; Desktop-only users are handed off through a Desktop-created local project thread after the helper claims the same build lease.",
     "developerName": "Heyu2002",
     "category": "Productivity",
     "capabilities": [
@@ -26,7 +26,7 @@
       "Hooks"
     ],
     "defaultPrompt": [
-      "Use $code-project-guidance-map to create or refresh this repository's signed AGENTS.md project index and per-module guide files. First decide macro module boundaries from shallow repo signals, then spawn bounded module subagents to create or refresh `.agents/guidance-map/modules/*.md`, then use the helper to sign module guides, link them from AGENTS.md, and sign the aggregate index. Do not do module-internal reading in the main thread."
+      "Use $code-project-guidance-map to refresh the signed AGENTS.md guidance map via its single builder."
     ]
   }
 }
