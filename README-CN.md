@@ -2,6 +2,8 @@
 
 [English README](README.md)
 
+[Changelog](CHANGELOG.md)
+
 Code Project Guidance Map 是一个 Codex plugin + skill，用来把项目结构沉淀成 Codex 可复用的项目记忆。
 
 它的目标不是生成一大篇项目手册，而是在项目根目录生成一个紧凑的 `AGENTS.md` 项目行动索引，并把模块内部细节拆到 `.agents/guidance-map/modules/` 下的独立 Markdown 文件中。
