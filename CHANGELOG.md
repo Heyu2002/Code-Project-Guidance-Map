@@ -11,12 +11,15 @@ This project follows semantic versioning for the guidance generator version. Pat
 - Added single-builder launch coordination for `guidance_map.py build`, including per-repository build state, active-builder leases, queued request context, `build-drain`, `build-finish`, and stale lease handling.
 - Added `--launcher auto|cli|desktop` so pure CLI users launch through `codex exec`, while pure Codex Desktop users can create a Desktop builder thread from the returned prompt and attach it with `build-attach`.
 - Added Desktop fallback output for `desktop_launch_required`, including the builder prompt, attach command, and failure cleanup command.
+- Added module subagent fan-out and lifecycle limits for builder runs, defaulting to 3 concurrent worker slots and 8 total module subagents per build pass, with environment-variable and CLI overrides. Completed module agents must now be immediately reused for the next module task or closed.
 - Added tests for active-builder queuing, CLI launcher validation, Desktop handoff, Desktop attachment, and queue-before-launcher-resolution behavior.
 
 ### Changed
 
 - Updated skill instructions, hook messages, README copy, CI docs, and plugin metadata so ordinary threads always route map construction through the single builder instead of building directly.
 - Shortened the plugin default prompt so Codex Desktop accepts it.
+- Changed `--launcher auto` to prefer Codex Desktop handoff inside Desktop threads unless a CLI command is explicitly configured, avoiding Windows CLI process access and stdin pipe hangs.
+- Changed Windows builder launches to request hidden process startup where supported, reducing visible terminal noise for CLI-backed builds.
 
 ## 0.2.1 - 2026-06-16
 

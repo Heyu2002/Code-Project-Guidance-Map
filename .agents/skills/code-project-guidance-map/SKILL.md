@@ -17,6 +17,8 @@ This skill must protect the main thread context and enforce a single constructio
 
 The script-coordinated builder may do shallow repository scanning, macro module planning, index integration, and the final helper command, but module-internal reading and module-guide writing must still run in bounded module subagents.
 
+The builder must also protect the user's machine from subagent fan-out. Unless the builder prompt gives different values, run no more than 3 module subagents at the same time and create no more than 8 module subagents in one build pass. Treat those numbers as hard resource limits, not suggestions.
+
 ## Markers
 
 Manage only the content between these exact `AGENTS.md` markers:
@@ -101,6 +103,7 @@ python <skill-dir>/scripts/guidance_map.py verify --repo <repo-root>
 
 6. Decide the macro module map before delegation.
    - The builder agent owns the global module map: choose concise module names, group paths into modules, decide whether the run is full or incremental, and define bounded scopes for subagents.
+   - Keep the macro module map within the builder prompt's total module-subagent limit. If the repository has more natural modules than the limit allows, merge small or related paths into coarser module groups rather than spawning more agents.
    - Allowed in the builder thread before delegation: file listing, top-level directory inspection, root build/package manifests, existing `AGENTS.md` index, `verify` JSON, module guide paths, and names of known packages/modules.
    - Not allowed in the builder thread: opening source files across modules to infer internals, recursive implementation reading, broad import tracing, or writing module summaries from source content.
    - Do not spawn module subagents until the draft macro map exists.
@@ -109,12 +112,20 @@ python <skill-dir>/scripts/guidance_map.py verify --repo <repo-root>
 
 7. Run mandatory module subagents.
    - Treat invocation of this skill as authorization to use subagents for this workflow. Do not ask again for subagent approval.
-   - Spawn one bounded module subagent per useful module group. For incremental updates, cover every affected module group and changed-file scope. For full refreshes, cover every macro module group.
+   - Spawn one bounded module subagent per useful module group, but never exceed the builder prompt's total module-subagent limit. For incremental updates, cover every affected module group and changed-file scope by merging related scopes if needed. For full refreshes, cover every macro module group after applying the total limit.
+   - Treat the concurrent module-subagent limit as a fixed worker-slot count. Each worker slot may own only one module task at a time.
+   - Never launch all module subagents at once. Run them in batches and keep active module subagents at or below the builder prompt's concurrent module-subagent limit.
+   - When a module subagent completes, immediately collect its final result and verify its expected module guide file exists.
+   - If more module groups remain and the subagent tool supports sending a new task to the same completed agent, prefer reusing that same agent with a fresh assignment for the next module group. The fresh assignment must name the new module, output path, bounded path scope, and must tell the agent not to edit previous module guide files.
+   - If you do not immediately reuse a completed module subagent, close it before starting or waiting on other module work. Completed agents must not remain open until the end of the build.
+   - After a reused agent completes its final assigned module, close it immediately after collecting its result.
+   - Before final validation and `build-finish`, close every module subagent that is still open.
    - Give each module subagent: module name, bounded path scope, module guide output path, relevant changed files if any, and the exact module guide format.
    - Each module subagent must create or update only its assigned module guide file, normally under `.agents/guidance-map/modules/<module-slug>.md`.
    - Module subagents must not decide global module boundaries and must not edit unrelated module guide files.
    - Module subagents may update their own module index entry draft or return it, but the final `AGENTS.md` write must go through the helper so signatures stay consistent.
    - Do not start another project-map builder from a module subagent.
+   - If the repository is too large to represent usefully within the total module-subagent limit, prefer a coarser but complete guide map and explicitly note the grouping tradeoff in the final summary. Do not start extra module subagents without the user explicitly increasing the limit.
 
 8. Write the project index draft in a temporary file.
    - The index draft is the content that will appear inside the `AGENTS.md` marker block after metadata/signature lines.
@@ -287,6 +298,8 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 - Never run more than one project-map builder for the same repository. If a builder is active, synchronize context into that builder through `guidance_map.py build`.
 - Never remove user-authored `AGENTS.md` content outside the marker block.
 - Never perform project-wide or module-internal full reads in the builder thread. Use bounded module subagents.
+- Never exceed the module-subagent total or concurrent limits from the builder prompt. Defaults are 8 total module subagents per build pass and 3 running at the same time.
+- Never leave completed module subagents open after their result has been collected. Reuse the same agent immediately for the next module task or close it immediately.
 - If subagents are unavailable and `run_mode` is not `no-op`, the script-coordinated builder must switch to `plan-only` and output the bounded refresh plan without reading module internals or writing guidance files.
 - Treat generated signature blocks as plugin-owned. Manual edits invalidate signatures and require a plugin refresh.
 - If marker structure is malformed, stop and report the issue instead of guessing.

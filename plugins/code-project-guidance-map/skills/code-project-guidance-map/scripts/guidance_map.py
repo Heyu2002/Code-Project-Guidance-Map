@@ -42,9 +42,13 @@ BUILD_LAUNCHER_ENV = "CODE_PROJECT_GUIDANCE_MAP_LAUNCHER"
 BUILD_DESKTOP_LAUNCH_GRACE_SECONDS_ENV = "CODE_PROJECT_GUIDANCE_MAP_DESKTOP_LAUNCH_GRACE_SECONDS"
 BUILD_STALE_SECONDS_ENV = "CODE_PROJECT_GUIDANCE_MAP_BUILD_STALE_SECONDS"
 BUILD_STATE_LOCK_TIMEOUT_ENV = "CODE_PROJECT_GUIDANCE_MAP_BUILD_STATE_LOCK_TIMEOUT"
+BUILD_MAX_CONCURRENT_MODULE_SUBAGENTS_ENV = "CODE_PROJECT_GUIDANCE_MAP_MAX_CONCURRENT_MODULE_SUBAGENTS"
+BUILD_MAX_TOTAL_MODULE_SUBAGENTS_ENV = "CODE_PROJECT_GUIDANCE_MAP_MAX_TOTAL_MODULE_SUBAGENTS"
 DEFAULT_BUILD_STALE_SECONDS = 6 * 60 * 60
 DEFAULT_DESKTOP_LAUNCH_GRACE_SECONDS = 10 * 60
 DEFAULT_BUILD_STATE_LOCK_TIMEOUT_SECONDS = 10.0
+DEFAULT_MAX_CONCURRENT_MODULE_SUBAGENTS = 3
+DEFAULT_MAX_TOTAL_MODULE_SUBAGENTS = 8
 BUILD_LAUNCH_GRACE_SECONDS = 60.0
 GENERATED_AT_RE = re.compile(r"^Generated at:\s*(?P<value>.+?)\s*$", re.MULTILINE)
 GENERATOR_RE = re.compile(r"^Generator:\s*(?P<value>.+?)\s*$", re.MULTILINE)
@@ -713,6 +717,38 @@ def normalize_context_text(context: str | None, context_file: Path | None) -> st
     return text
 
 
+def positive_int_setting(value: int | str | None, env_name: str, default: int) -> int:
+    raw_value: int | str | None = value
+    if raw_value is None:
+        raw_value = os.environ.get(env_name)
+    if raw_value is None or str(raw_value).strip() == "":
+        return default
+    try:
+        parsed = int(str(raw_value).strip())
+    except ValueError as exc:
+        raise GuidanceMapError(f"{env_name} must be a positive integer.") from exc
+    if parsed < 1:
+        raise GuidanceMapError(f"{env_name} must be a positive integer.")
+    return parsed
+
+
+def module_subagent_limits(
+    max_concurrent: int | str | None = None,
+    max_total: int | str | None = None,
+) -> tuple[int, int]:
+    total = positive_int_setting(
+        max_total,
+        BUILD_MAX_TOTAL_MODULE_SUBAGENTS_ENV,
+        DEFAULT_MAX_TOTAL_MODULE_SUBAGENTS,
+    )
+    concurrent = positive_int_setting(
+        max_concurrent,
+        BUILD_MAX_CONCURRENT_MODULE_SUBAGENTS_ENV,
+        DEFAULT_MAX_CONCURRENT_MODULE_SUBAGENTS,
+    )
+    return min(concurrent, total), total
+
+
 def build_request_context(
     repo: Path,
     verification: dict[str, object],
@@ -741,6 +777,8 @@ def builder_prompt(
     verification: dict[str, object],
     request_context: dict[str, Any],
     state_dir: Path,
+    max_concurrent_module_subagents: int,
+    max_total_module_subagents: int,
 ) -> str:
     return f"""You are the script-coordinated Code Project Guidance Map builder agent.
 
@@ -754,11 +792,26 @@ Your task:
 1. Read the local `code-project-guidance-map` skill instructions. Because this prompt was launched by `guidance_map.py build`, operate in Builder Agent Mode: perform the direct map construction workflow in this agent instead of delegating back to `build`.
 2. Run `python {script_path} status --repo {repo}` and `python {script_path} verify --repo {repo}`.
 3. If the guidance is current and no refresh was explicitly requested, release the lease with `python {script_path} build-finish --repo {repo} --build-id {build_id} --status complete`.
-4. For generate, full refresh, or incremental refresh work, use bounded module subagents exactly as the skill requires. The main builder owns only shallow scanning, macro module boundaries, index integration, and final helper commands.
+4. For generate, full refresh, or incremental refresh work, use bounded module subagents exactly as the skill requires and obey the hard resource limits below. The main builder owns only shallow scanning, macro module boundaries, index integration, and final helper commands.
 5. Write module guides, create the temporary index draft, then run `python {script_path} update --repo {repo} --guidance-file <temp-index.md>`.
 6. Validate with `python {script_path} status --repo {repo}`.
 7. Before finalizing, run `python {script_path} build-drain --repo {repo} --build-id {build_id}`. If it returns pending contexts, fold them into your working context, re-run `verify`, and perform another build pass. Repeat until `pending_contexts` is empty.
 8. Release the lease only after the final pass with `python {script_path} build-finish --repo {repo} --build-id {build_id} --status complete`. If you cannot complete, run the same command with `--status failed --message <reason>`.
+
+Module subagent resource limits:
+- Maximum module subagents running at the same time: {max_concurrent_module_subagents}
+- Maximum total module subagents to create in one build pass: {max_total_module_subagents}
+- These are hard limits. Batch module work; after starting at most {max_concurrent_module_subagents} module subagents, wait for and close completed ones before starting another batch.
+- If the macro module map has more than {max_total_module_subagents} useful module groups, merge small or related paths into coarser module groups. Do not create extra module subagents unless the user explicitly asks for a higher limit.
+- Prefer a smaller number of coarse module guides over opening many terminals or agent panes.
+
+Module subagent lifecycle rules:
+- Treat the concurrent limit as worker slots, not as "start this many and leave them open." Each slot may own only one module task at a time.
+- When a module subagent finishes, immediately capture its final result and verify the expected guide file exists.
+- If more module tasks remain and the tool supports sending a new task to the same completed agent, reuse that same agent with a fresh assignment for the next module group so the UI does not grow more panes.
+- If you do not reuse that completed agent immediately, close it immediately before starting or waiting on other module work. Completed agents must not remain open until the end of the build.
+- If a reused agent completes its final assigned module, close it immediately after collecting its result.
+- Before final validation and build-finish, close every module subagent that is still open.
 
 Initial verification JSON:
 ```json
@@ -858,6 +911,8 @@ def resolve_build_launcher(launcher: str | None, codex_command: str | None) -> t
         if not desktop_launcher_available():
             return "desktop", None, "Desktop launcher was requested; create_thread must be available in the current Codex app thread."
         return "desktop", None, None
+    if launcher_value == "auto" and desktop_launcher_available() and not explicit_command:
+        return "desktop", None, "Codex Desktop environment detected; using Desktop builder handoff."
 
     try:
         return "cli", resolve_codex_command(codex_command), None
@@ -865,6 +920,24 @@ def resolve_build_launcher(launcher: str | None, codex_command: str | None) -> t
         if launcher_value == "auto" and not explicit_command and desktop_launcher_available():
             return "desktop", None, str(exc)
         raise
+
+
+def windows_command_is_batch_wrapper(command: list[str]) -> bool:
+    if os.name != "nt" or not command:
+        return False
+    return Path(command[0]).suffix.casefold() in {".bat", ".cmd"}
+
+
+def windows_hidden_startupinfo() -> Any | None:
+    if os.name != "nt":
+        return None
+    startupinfo_factory = getattr(subprocess, "STARTUPINFO", None)
+    if startupinfo_factory is None:
+        return None
+    startupinfo = startupinfo_factory()
+    startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    return startupinfo
 
 
 def launch_builder_agent(
@@ -906,25 +979,34 @@ def launch_builder_agent(
     creationflags = 0
     start_new_session = os.name != "nt"
     if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if not windows_command_is_batch_wrapper(command):
+            creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+    startupinfo = windows_hidden_startupinfo()
     log_handle = log_file.open("a", encoding="utf-8")
+    stdin_handle = None
     try:
+        stdin_handle = prompt_file.open("r", encoding="utf-8")
         process = subprocess.Popen(
             cmd,
             cwd=str(repo),
             env=env,
-            stdin=subprocess.PIPE,
+            stdin=stdin_handle,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             text=True,
             start_new_session=start_new_session,
             creationflags=creationflags,
+            startupinfo=startupinfo,
         )
-        assert process.stdin is not None
-        process.stdin.write(prompt)
-        process.stdin.close()
         time.sleep(0.2)
-        if process.poll() is not None:
+        try:
+            exited = process.poll() is not None
+        except OSError:
+            if os.name != "nt":
+                raise
+            exited = False
+        if exited:
             raise GuidanceMapError(f"Builder agent exited during startup with code {process.returncode}. See {log_file}.")
         DETACHED_BUILDER_PROCESSES.append(process)
         return {
@@ -937,7 +1019,11 @@ def launch_builder_agent(
     except OSError as exc:
         raise GuidanceMapError(f"Unable to launch builder agent: {exc}") from exc
     finally:
+        if stdin_handle is not None:
+            stdin_handle.close()
         log_handle.close()
+
+
 def start_guidance_build(
     repo_arg: Path,
     reason: str | None = None,
@@ -947,6 +1033,8 @@ def start_guidance_build(
     model: str | None = None,
     extra_args: list[str] | None = None,
     launcher: str | None = None,
+    max_concurrent_module_subagents: int | str | None = None,
+    max_total_module_subagents: int | str | None = None,
 ) -> dict[str, Any]:
     root, git_available = repo_root(repo_arg)
     verification = verify(root)
@@ -954,6 +1042,11 @@ def start_guidance_build(
     state_dir.mkdir(parents=True, exist_ok=True)
     request_context = build_request_context(root, verification, reason, context, context_file)
     script_path = Path(__file__).resolve()
+    max_concurrent, max_total = module_subagent_limits(max_concurrent_module_subagents, max_total_module_subagents)
+    subagent_limits = {
+        "max_concurrent_module_subagents": max_concurrent,
+        "max_total_module_subagents": max_total,
+    }
 
     with BuildStateMutex(state_dir):
         state = read_build_state(state_dir, root, git_available)
@@ -978,7 +1071,7 @@ def start_guidance_build(
         launcher_value, resolved_command, launcher_note = resolve_build_launcher(launcher, codex_command)
         build_id = uuid.uuid4().hex
         started_at = utc_now()
-        prompt = builder_prompt(root, build_id, script_path, verification, request_context, state_dir)
+        prompt = builder_prompt(root, build_id, script_path, verification, request_context, state_dir, max_concurrent, max_total)
         active = {
             "build_id": build_id,
             "repo_root": str(root),
@@ -987,6 +1080,7 @@ def start_guidance_build(
             "launcher": launcher_value,
             "started_at": started_at,
             "pid": None,
+            "module_subagent_limits": subagent_limits,
         }
         state["active"] = active
         state.setdefault("pending_contexts", [])
@@ -1012,6 +1106,7 @@ def start_guidance_build(
                 "state_file": str(build_state_path(state_dir)),
                 "prompt_file": str(prompt_file),
                 "prompt": prompt,
+                "module_subagent_limits": subagent_limits,
                 "attach_command": f"python {script_path} build-attach --repo {root} --build-id {build_id} --thread-id <created-thread-id>",
                 "finish_failed_command": f"python {script_path} build-finish --repo {root} --build-id {build_id} --status failed --force --message <reason>",
                 "message": (
@@ -1060,6 +1155,7 @@ def start_guidance_build(
             "prompt_file": launch["prompt_file"],
             "log_file": launch["log_file"],
             "last_message_file": launch["last_message_file"],
+            "module_subagent_limits": subagent_limits,
             "message": "Builder agent started; guidance_map.py build is exiting now.",
         }
 
@@ -2099,9 +2195,28 @@ def main() -> int:
         "--launcher",
         choices=("auto", "cli", "desktop"),
         default=None,
-        help="Builder launcher. auto uses CLI when available and Desktop handoff from Codex Desktop otherwise.",
+        help=(
+            "Builder launcher. auto uses Desktop handoff from Codex Desktop unless a Codex command is explicitly "
+            "configured; otherwise it uses CLI."
+        ),
     )
     build_parser.add_argument("--model", help="Optional model passed through to `codex exec`.")
+    build_parser.add_argument(
+        "--max-concurrent-module-subagents",
+        type=int,
+        help=(
+            f"Maximum module subagents that may run at the same time; defaults to "
+            f"{BUILD_MAX_CONCURRENT_MODULE_SUBAGENTS_ENV} or {DEFAULT_MAX_CONCURRENT_MODULE_SUBAGENTS}."
+        ),
+    )
+    build_parser.add_argument(
+        "--max-total-module-subagents",
+        type=int,
+        help=(
+            f"Maximum module subagents to create in one build pass; defaults to "
+            f"{BUILD_MAX_TOTAL_MODULE_SUBAGENTS_ENV} or {DEFAULT_MAX_TOTAL_MODULE_SUBAGENTS}."
+        ),
+    )
     build_parser.add_argument(
         "--agent-arg",
         action="append",
@@ -2143,6 +2258,8 @@ def main() -> int:
                 model=args.model,
                 extra_args=args.agent_arg,
                 launcher=args.launcher,
+                max_concurrent_module_subagents=args.max_concurrent_module_subagents,
+                max_total_module_subagents=args.max_total_module_subagents,
             )
         elif args.command == "build-attach":
             output = attach_desktop_builder_thread(Path(args.repo), args.build_id, args.thread_id)

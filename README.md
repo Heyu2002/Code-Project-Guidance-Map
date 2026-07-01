@@ -8,6 +8,12 @@ Code Project Guidance Map is a Codex plugin and skill that turns repository stru
 
 It does not try to generate a giant project manual. It creates a compact `AGENTS.md` project action index, then stores module-specific detail in separate signed Markdown files under `.agents/guidance-map/modules/`.
 
+## graphify Comparison Summary
+
+See [docs/graphify-comparison.md](docs/graphify-comparison.md) for the full benchmark against [graphify](https://github.com/safishamsi/graphify) on fresh remote Java, Python, Rust, and C# repositories.
+
+Short version: Code Project Guidance Map is an editing-route memory layer for Codex (`AGENTS.md` plus signed lazy module guides), while graphify is a queryable knowledge-graph index (`graphify-out/graph.json` plus reports/tools). In this run, graphify produced AST-only graphs in 2.65s to 64.30s and estimated 10.4x to 23.7x fewer query tokens than naive full-context reading; this plugin's `verify` path classified fresh repositories in 0.46s to 0.71s, and a native Codex builder run generated a valid Spring guide `AGENTS.md` plus five signed module guides in 6m14s. The report now includes a same-dimension matrix covering format, token/context cost, speed, scale, language coverage, query ability, editing constraints, CI fit, and offline behavior. An earlier no-output CLI attempt was traced to the Windows npm `codex.CMD` shim being launched with `DETACHED_PROCESS`; `.cmd/.bat` builders are now launched without that detached flag.
+
 ## Background
 
 This plugin comes from the Codex repository feature request: [Feature request: Add a standardized code audit module for modular codebases #26007](https://github.com/openai/codex/issues/26007).
@@ -25,7 +31,7 @@ When invoked in a target repository, the skill will:
 - Start or coordinate one Codex builder thread per repository through `guidance_map.py build`.
 - Synchronize later build requests into the active builder instead of allowing concurrent map construction.
 - Let the builder agent decide the macro module map from shallow repository signals.
-- Require bounded module subagents to read module internals and write one module guide file per module.
+- Require bounded module subagents to read module internals and write one module guide file per module group, with default resource limits of 3 concurrent module subagents and 8 total module subagents per build pass.
 - Keep `AGENTS.md` as a compact project index: global editing rules, task routing, dependency rules, and module links.
 - Store module-specific structure, entry points, and local rules in `.agents/guidance-map/modules/*.md`.
 - Sign every module guide, then write the module signatures into `AGENTS.md`.
@@ -87,7 +93,7 @@ After installation, open a new Codex thread in the project you want to map and i
 Use $code-project-guidance-map to refresh the signed AGENTS.md guidance map via its single builder.
 ```
 
-The build helper uses `guidance_map.py build --launcher auto`. Pure CLI users are launched through `codex exec`, using a runnable `codex` command on PATH or `CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND` / `--codex-command`. Pure Codex Desktop users do not need a separate CLI install: the helper claims the single build lease, returns a Desktop builder prompt, and the current Desktop thread creates a new local project thread with that prompt, then records the created thread id with `build-attach`.
+The build helper uses `guidance_map.py build --launcher auto`. CLI users are launched through `codex exec`, using a runnable `codex` command on PATH or `CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND` / `--codex-command`. Codex Desktop users do not need a separate CLI install: with `auto`, the helper claims the single build lease, returns a Desktop builder prompt, and the current Desktop thread creates a new local project thread with that prompt, then records the created thread id with `build-attach`. To force CLI from Desktop, pass `--launcher cli` or configure `CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND`.
 
 ## Usage
 
@@ -122,7 +128,7 @@ Module index entries can include optional lazy-read hints:
 
 Hooks are read-only. They verify the current repository's guidance and add bounded context when the index or module guides are missing, stale, or unverifiable. Hook messages are state-machine driven: state is stored in the user's Codex home, but debounce decisions are scoped by project and session so one stale project does not silence another. By default, the same project/session/action is only reported once. After a code-edit-like prompt, `Stop` emits a continuation system message that tells Codex to call `guidance_map.py build --launcher auto` before finalizing. The helper either starts the single builder agent, prepares a Desktop builder thread handoff, or synchronizes the current thread context into the already active builder. Set `CODE_PROJECT_GUIDANCE_MAP_HOOK_LEVEL=off|error|stale|all` to tune hook noise.
 
-Subagents are mandatory for generation and refresh, but only inside the script-coordinated builder agent. Ordinary threads must not construct the map directly; they call `guidance_map.py build --launcher auto` and stop once the request is started, queued, or handed off to a Desktop-created builder thread. Module subagents write their assigned module guide files directly. The builder agent owns only the macro module map and the compact `AGENTS.md` index draft, then runs the helper to sign module files, backfill module signatures into the index, and write the aggregate signed `AGENTS.md` block. If coding changes make guidance stale, Codex should call the build helper immediately before the final response. If builder subagents are unavailable, the builder falls back to `plan-only`: it outputs the macro module map, affected files, bounded subagent scopes, and follow-up command, but does not read module internals or write guidance files.
+Subagents are mandatory for generation and refresh, but only inside the script-coordinated builder agent. Ordinary threads must not construct the map directly; they call `guidance_map.py build --launcher auto` and stop once the request is started, queued, or handed off to a Desktop-created builder thread. Module subagents write their assigned module guide files directly, but fan-out is capped and lifecycle-managed: by default the builder may run at most 3 module subagents at once and create at most 8 module subagents in one build pass. Treat those concurrent agents as worker slots. When a module task finishes, the builder must collect the result, then either reuse that same completed agent immediately for the next module task or close it immediately before moving on. Completed agents must not pile up until the end of the build. If a repository has more natural modules, the builder must merge related paths into coarser module groups instead of opening more terminals or agent panes. Tune this with `CODE_PROJECT_GUIDANCE_MAP_MAX_CONCURRENT_MODULE_SUBAGENTS`, `CODE_PROJECT_GUIDANCE_MAP_MAX_TOTAL_MODULE_SUBAGENTS`, or the matching `build` flags. The builder agent owns only the macro module map and the compact `AGENTS.md` index draft, then runs the helper to sign module files, backfill module signatures into the index, and write the aggregate signed `AGENTS.md` block. If coding changes make guidance stale, Codex should call the build helper immediately before the final response. If builder subagents are unavailable, the builder falls back to `plan-only`: it outputs the macro module map, affected files, bounded subagent scopes, and follow-up command, but does not read module internals or write guidance files.
 
 ## Result
 

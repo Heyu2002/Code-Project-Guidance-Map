@@ -23,7 +23,7 @@ Code Project Guidance Map 是一个 Codex plugin + skill，用来把项目结构
 - 检查项目根目录是否存在 `AGENTS.md` 以及本插件生成的 marker 区块。
 - 首次生成时询问用户，除非用户已经明确要求生成或刷新。
 - 由主 agent 根据浅层仓库信号决定宏观模块划分。
-- 强制使用有边界的模块 subagents 阅读模块内部，并为每个模块写一个独立模块 guide。
+- 强制使用有边界的模块 subagents 阅读模块内部，并为每个模块组写一个独立模块 guide；默认限制为每次构建最多同时运行 3 个模块 subagent、总共最多创建 8 个模块 subagent。
 - 让 `AGENTS.md` 只保存项目级索引：全局编辑规则、任务路由、依赖规则和模块链接。
 - 把模块内部结构、关键入口和局部规则保存到 `.agents/guidance-map/modules/*.md`。
 - 给每个模块 guide 生成独立签名，再把模块签名写回 `AGENTS.md`。
@@ -118,7 +118,7 @@ Use $code-project-guidance-map, then help me identify where this feature should 
 
 hooks 是只读的。它们会验证当前仓库的 `AGENTS.md` 索引和模块 guide 签名，并在缺失、过期或无法验签时给 Codex 注入有边界的上下文。hook 消息由状态机降噪：状态保存在用户的 Codex home 下，但判断粒度是项目和 session。默认同一个项目、同一个 session、同一个 action 只提示一次。发生过代码编辑类 prompt 后，`Stop` 会发出 continuation system message，要求 Codex 在 final 前立即刷新受影响指引，而不是把刷新留作下一次任务的提醒。hooks 不会自己编辑文件。
 
-生成和刷新必须使用 subagents。模块 subagent 直接写自己负责的模块 guide 文件。主 agent 只负责宏观模块划分和紧凑的 `AGENTS.md` 索引草稿，然后运行 helper 给模块文件签名、把模块签名回填进索引，并写入带总签名的 `AGENTS.md` 区块。如果编码改动让指引过期，Codex 应该在 final 前立即刷新受影响模块；如果 subagents 不可用，则进入 `plan-only`，只输出有边界的刷新计划，不读模块内部、不写指引文件。
+生成和刷新必须使用 subagents，但只能在脚本协调的 builder agent 内使用。模块 subagent 直接写自己负责的模块 guide 文件，并且必须限流和管理生命周期：默认同时最多运行 3 个模块 subagent，每次构建总共最多创建 8 个模块 subagent。这里的并发数应当被当成固定 worker slot。某个模块任务完成后，builder 必须先收集结果，然后要么立刻复用同一个已完成 agent 去做下一个模块，要么立刻关闭它再继续；不能把 completed agents 一直堆到构建最后统一关闭。如果仓库天然模块更多，builder 必须把相关路径合并成更粗的模块组，不能继续打开更多 terminal 或 agent pane。可通过 `CODE_PROJECT_GUIDANCE_MAP_MAX_CONCURRENT_MODULE_SUBAGENTS`、`CODE_PROJECT_GUIDANCE_MAP_MAX_TOTAL_MODULE_SUBAGENTS` 或对应的 `build` 参数调整。主 agent 只负责宏观模块划分和紧凑的 `AGENTS.md` 索引草稿，然后运行 helper 给模块文件签名、把模块签名回填进索引，并写入带总签名的 `AGENTS.md` 区块。如果编码改动让指引过期，Codex 应该在 final 前立即刷新受影响模块；如果 subagents 不可用，则进入 `plan-only`，只输出有边界的刷新计划，不读模块内部、不写指引文件。
 
 ## 会产生什么
 

@@ -44,6 +44,8 @@ class GuidanceMapTests(unittest.TestCase):
         self.old_validate_codex = os.environ.get(guidance_map.BUILD_CODEX_VALIDATE_ENV)
         self.old_launcher = os.environ.get(guidance_map.BUILD_LAUNCHER_ENV)
         self.old_desktop_grace = os.environ.get(guidance_map.BUILD_DESKTOP_LAUNCH_GRACE_SECONDS_ENV)
+        self.old_max_concurrent_subagents = os.environ.get(guidance_map.BUILD_MAX_CONCURRENT_MODULE_SUBAGENTS_ENV)
+        self.old_max_total_subagents = os.environ.get(guidance_map.BUILD_MAX_TOTAL_MODULE_SUBAGENTS_ENV)
         self.old_originator = os.environ.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE")
         os.environ[guidance_map.SIGNATURE_SECRET_ENV] = TEST_SECRET_HEX
         os.environ[guidance_map.SIGNATURE_KEY_HOME_ENV] = str(self.repo / ".keys")
@@ -52,6 +54,8 @@ class GuidanceMapTests(unittest.TestCase):
         os.environ.pop(guidance_map.BUILD_CODEX_VALIDATE_ENV, None)
         os.environ.pop(guidance_map.BUILD_LAUNCHER_ENV, None)
         os.environ.pop(guidance_map.BUILD_DESKTOP_LAUNCH_GRACE_SECONDS_ENV, None)
+        os.environ.pop(guidance_map.BUILD_MAX_CONCURRENT_MODULE_SUBAGENTS_ENV, None)
+        os.environ.pop(guidance_map.BUILD_MAX_TOTAL_MODULE_SUBAGENTS_ENV, None)
         os.environ.pop("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", None)
 
     def tearDown(self) -> None:
@@ -83,6 +87,14 @@ class GuidanceMapTests(unittest.TestCase):
             os.environ.pop(guidance_map.BUILD_DESKTOP_LAUNCH_GRACE_SECONDS_ENV, None)
         else:
             os.environ[guidance_map.BUILD_DESKTOP_LAUNCH_GRACE_SECONDS_ENV] = self.old_desktop_grace
+        if self.old_max_concurrent_subagents is None:
+            os.environ.pop(guidance_map.BUILD_MAX_CONCURRENT_MODULE_SUBAGENTS_ENV, None)
+        else:
+            os.environ[guidance_map.BUILD_MAX_CONCURRENT_MODULE_SUBAGENTS_ENV] = self.old_max_concurrent_subagents
+        if self.old_max_total_subagents is None:
+            os.environ.pop(guidance_map.BUILD_MAX_TOTAL_MODULE_SUBAGENTS_ENV, None)
+        else:
+            os.environ[guidance_map.BUILD_MAX_TOTAL_MODULE_SUBAGENTS_ENV] = self.old_max_total_subagents
         if self.old_originator is None:
             os.environ.pop("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", None)
         else:
@@ -477,6 +489,139 @@ class GuidanceMapTests(unittest.TestCase):
         finished = guidance_map.finish_guidance_build(self.repo, str(result["build_id"]), "abandoned", force=True)
         self.assertEqual(finished["finish_status"], "abandoned")
 
+    def test_build_prompt_includes_default_module_subagent_limits(self) -> None:
+        prompt = guidance_map.builder_prompt(
+            self.repo,
+            "limit-build",
+            Path("guidance_map.py"),
+            {"recommended_action": "full_refresh"},
+            {"context": "limit test"},
+            self.repo / ".build-state",
+            guidance_map.DEFAULT_MAX_CONCURRENT_MODULE_SUBAGENTS,
+            guidance_map.DEFAULT_MAX_TOTAL_MODULE_SUBAGENTS,
+        )
+
+        self.assertIn("Maximum module subagents running at the same time: 3", prompt)
+        self.assertIn("Maximum total module subagents to create in one build pass: 8", prompt)
+        self.assertIn("Batch module work", prompt)
+        self.assertIn("Treat the concurrent limit as worker slots", prompt)
+        self.assertIn("reuse that same agent with a fresh assignment", prompt)
+        self.assertIn("Completed agents must not remain open until the end of the build", prompt)
+
+    def test_module_subagent_limits_are_configurable_and_clamped(self) -> None:
+        os.environ[guidance_map.BUILD_MAX_CONCURRENT_MODULE_SUBAGENTS_ENV] = "9"
+        os.environ[guidance_map.BUILD_MAX_TOTAL_MODULE_SUBAGENTS_ENV] = "4"
+
+        concurrent, total = guidance_map.module_subagent_limits()
+
+        self.assertEqual(concurrent, 4)
+        self.assertEqual(total, 4)
+
+    def test_module_subagent_limits_reject_invalid_values(self) -> None:
+        os.environ[guidance_map.BUILD_MAX_CONCURRENT_MODULE_SUBAGENTS_ENV] = "0"
+
+        with self.assertRaises(guidance_map.GuidanceMapError):
+            guidance_map.module_subagent_limits()
+
+    def test_launch_builder_agent_passes_prompt_file_as_stdin(self) -> None:
+        process = mock.Mock()
+        process.pid = 1234
+        process.poll.return_value = None
+        state_dir = self.repo / ".build-state"
+
+        with mock.patch("guidance_map.subprocess.Popen", return_value=process) as popen:
+            result = guidance_map.launch_builder_agent(
+                self.repo,
+                "stdin-build",
+                "prompt text",
+                state_dir,
+                codex_command=None,
+                model=None,
+                extra_args=[],
+                resolved_command=[sys.executable, "-c", "pass"],
+            )
+
+        stdin_arg = popen.call_args.kwargs["stdin"]
+        self.assertNotEqual(stdin_arg, subprocess.PIPE)
+        self.assertTrue(stdin_arg.closed)
+        self.assertEqual(Path(stdin_arg.name).read_text(encoding="utf-8"), "prompt text")
+        self.assertEqual(result["pid"], 1234)
+
+    def test_windows_poll_access_denied_does_not_fail_builder_start(self) -> None:
+        process = mock.Mock()
+        process.pid = 1234
+        process.poll.side_effect = PermissionError("Access is denied")
+        state_dir = self.repo / ".build-state"
+
+        with (
+            mock.patch("guidance_map.os.name", "nt"),
+            mock.patch("guidance_map.subprocess.Popen", return_value=process),
+        ):
+            result = guidance_map.launch_builder_agent(
+                self.repo,
+                "access-denied-build",
+                "prompt text",
+                state_dir,
+                codex_command=None,
+                model=None,
+                extra_args=[],
+                resolved_command=[sys.executable, "-c", "pass"],
+            )
+
+        self.assertEqual(result["pid"], 1234)
+
+    def test_windows_cmd_shim_is_not_detached(self) -> None:
+        process = mock.Mock()
+        process.pid = 1234
+        process.poll.return_value = None
+        state_dir = self.repo / ".build-state"
+
+        with (
+            mock.patch("guidance_map.os.name", "nt"),
+            mock.patch.object(guidance_map.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, create=True),
+            mock.patch.object(guidance_map.subprocess, "DETACHED_PROCESS", 0x8, create=True),
+            mock.patch("guidance_map.subprocess.Popen", return_value=process) as popen,
+        ):
+            result = guidance_map.launch_builder_agent(
+                self.repo,
+                "cmd-shim-build",
+                "prompt text",
+                state_dir,
+                codex_command=None,
+                model=None,
+                extra_args=[],
+                resolved_command=[r"C:\Users\tester\AppData\Roaming\npm\codex.CMD"],
+            )
+
+        self.assertEqual(result["pid"], 1234)
+        self.assertEqual(popen.call_args.kwargs["creationflags"], 0x200)
+
+    def test_windows_native_exe_stays_detached(self) -> None:
+        process = mock.Mock()
+        process.pid = 1234
+        process.poll.return_value = None
+        state_dir = self.repo / ".build-state"
+
+        with (
+            mock.patch("guidance_map.os.name", "nt"),
+            mock.patch.object(guidance_map.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, create=True),
+            mock.patch.object(guidance_map.subprocess, "DETACHED_PROCESS", 0x8, create=True),
+            mock.patch("guidance_map.subprocess.Popen", return_value=process) as popen,
+        ):
+            result = guidance_map.launch_builder_agent(
+                self.repo,
+                "native-exe-build",
+                "prompt text",
+                state_dir,
+                codex_command=None,
+                model=None,
+                extra_args=[],
+                resolved_command=[r"C:\Program Files\Codex\codex.exe"],
+            )
+
+        self.assertEqual(result["pid"], 1234)
+        self.assertEqual(popen.call_args.kwargs["creationflags"], 0x208)
+
     def test_default_build_requires_runnable_codex_command(self) -> None:
         old_path = os.environ.get("PATH")
         try:
@@ -494,9 +639,9 @@ class GuidanceMapTests(unittest.TestCase):
         command = guidance_map.resolve_codex_command(f"{sys.executable} fake_codex.py")
         self.assertEqual(command, [sys.executable, "fake_codex.py"])
 
-    def test_auto_build_falls_back_to_desktop_handoff_in_desktop_thread(self) -> None:
+    def test_auto_build_prefers_desktop_handoff_in_desktop_thread(self) -> None:
         os.environ["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] = "Codex Desktop"
-        with mock.patch("guidance_map.shutil.which", return_value=None):
+        with mock.patch("guidance_map.resolve_codex_command", side_effect=AssertionError("CLI should not be resolved")):
             result = guidance_map.start_guidance_build(
                 self.repo,
                 reason="desktop-refresh",
