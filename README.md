@@ -6,13 +6,13 @@
 
 Code Project Guidance Map is a Codex plugin and skill that turns repository structure into reusable project memory for Codex.
 
-It does not try to generate a giant project manual. It creates a compact `AGENTS.md` project action index, then stores module-specific detail in separate signed Markdown files under `.agents/guidance-map/modules/`.
+It does not try to generate a giant project manual. It creates a compact `AGENTS.md` project action index, then stores module-specific detail in a manifest-backed guide tree under `.agents/guidance-map/guides/`.
 
 ## graphify Comparison Summary
 
 See [docs/graphify-comparison.md](docs/graphify-comparison.md) for the full benchmark against [graphify](https://github.com/safishamsi/graphify) on fresh remote Java, Python, Rust, and C# repositories.
 
-Short version: Code Project Guidance Map is an editing-route memory layer for Codex (`AGENTS.md` plus signed lazy module guides), while graphify is a queryable knowledge-graph index (`graphify-out/graph.json` plus reports/tools). In this run, graphify produced AST-only graphs in 2.65s to 64.30s and estimated 10.4x to 23.7x fewer query tokens than naive full-context reading; this plugin's `verify` path classified fresh repositories in 0.46s to 0.71s, and a native Codex builder run generated a valid Spring guide `AGENTS.md` plus five signed module guides in 6m14s. The report now includes a same-dimension matrix covering format, token/context cost, speed, scale, language coverage, query ability, editing constraints, CI fit, and offline behavior. An earlier no-output CLI attempt was traced to the Windows npm `codex.CMD` shim being launched with `DETACHED_PROCESS`; `.cmd/.bat` builders are now launched without that detached flag.
+Short version: Code Project Guidance Map is an editing-route memory layer for Codex (`AGENTS.md` plus a signed manifest and lazy guide tree), while graphify is a queryable knowledge-graph index (`graphify-out/graph.json` plus reports/tools). In this run, graphify produced AST-only graphs in 2.65s to 64.30s and estimated 10.4x to 23.7x fewer query tokens than naive full-context reading; this plugin's `verify` path classified fresh repositories in 0.46s to 0.71s, and a native Codex builder run generated a valid Spring guide `AGENTS.md` plus five signed module guides in 6m14s. After the deterministic pre-scan work, `compare-graphify` measured 0-token CPGM project maps in about 0.9s to 1.4s, with outputs 8.7x to 135.3x smaller than the corresponding graphify JSON graphs. The v4 tree-guide work adds manifest-backed file query: `query` verifies the manifest and only returns guide files whose content digest matches the signed manifest, while graphify remains an explicit deep-structure query path. The report now includes a same-dimension matrix covering format, token/context cost, speed, scale, language coverage, query ability, editing constraints, CI fit, offline behavior, and pre-scan/tree-guide comparisons.
 
 ## Background
 
@@ -32,11 +32,11 @@ When invoked in a target repository, the skill will:
 - Synchronize later build requests into the active builder instead of allowing concurrent map construction.
 - Let the builder agent decide the macro module map from shallow repository signals.
 - Require bounded module subagents to read module internals and write one module guide file per module group, with default resource limits of 3 concurrent module subagents and 8 total module subagents per build pass.
-- Keep `AGENTS.md` as a compact project index: global editing rules, task routing, dependency rules, and module links.
-- Store module-specific structure, entry points, and local rules in `.agents/guidance-map/modules/*.md`.
-- Sign every module guide, then write the module signatures into `AGENTS.md`.
-- Sign the aggregate `AGENTS.md` index so manual edits or broken module links are detectable.
-- Incrementally refresh affected module guides from Git changes instead of rereading the whole project.
+- Keep `AGENTS.md` as a compact project index: global editing rules, task routing, dependency rules, and a signed manifest pointer.
+- Store module-specific structure, entry points, and local rules in `.agents/guidance-map/guides/**`.
+- Write `.agents/guidance-map/manifest.json` with guide ids, parent/child links, tags, source globs, content digests, and source snapshots.
+- Sign the aggregate `AGENTS.md` index and the manifest so manual edits, manifest swaps, unsafe guide paths, or guide-content tampering are detectable.
+- Incrementally refresh affected guide-tree leaves from Git changes instead of rereading the whole project.
 - Capture a signed local-change baseline during refresh so dirty worktree files do not repeatedly trigger stale guidance until their content changes again.
 - Run lightweight hooks on `SessionStart`, `UserPromptSubmit`, and `Stop` to detect stale, missing, or unverifiable guidance and route refreshes through the single-builder helper.
 
@@ -47,15 +47,18 @@ The fixed `AGENTS.md` marker block is:
 <!-- code-project-guidance-map:end -->
 ```
 
-Module guide files have their own plugin-owned signature block:
+Tree guide files have their own plugin-owned metadata block. Their trust comes from the signed manifest content digest, not from a local per-file HMAC:
 
 ```markdown
-<!-- code-project-guidance-map:module:start -->
-Signature: hmac-sha256:<64 lowercase hex chars>
-<!-- code-project-guidance-map:module:end -->
+<!-- code-project-guidance-map:guide:start -->
+Guide ID: backend.api.controllers
+Guide kind: leaf
+Guide path: .agents/guidance-map/guides/backend/api/controllers.md
+Parent guide ID: backend.api
+<!-- code-project-guidance-map:guide:end -->
 ```
 
-The current generator version is `0.2.1`, and the current guide format is `action-map:v3`. A missing, invalid, or major/minor-incompatible version requires a full refresh. Patch-only version differences are treated as compatible.
+The current generator version is `0.3.0`, and the current guide format is `action-map:v4`. Legacy `action-map:v3` blocks can still be inspected and queried, but the next refresh rewrites them into the v4 manifest-backed guide tree. A missing, invalid, or major/minor-incompatible current version requires a full refresh. Patch-only version differences are treated as compatible.
 
 Freshness is content-based for local changes. `Generated at` bounds committed Git history, while the signed `Local change baseline` records staged, unstaged, and untracked file content that existed during the last refresh. A new Codex thread should not ask for another refresh for the same dirty files unless those files change again.
 
@@ -93,7 +96,7 @@ After installation, open a new Codex thread in the project you want to map and i
 Use $code-project-guidance-map to refresh the signed AGENTS.md guidance map via its single builder.
 ```
 
-The build helper uses `guidance_map.py build --launcher auto`. CLI users are launched through `codex exec`, using a runnable `codex` command on PATH or `CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND` / `--codex-command`. Codex Desktop users do not need a separate CLI install: with `auto`, the helper claims the single build lease, returns a Desktop builder prompt, and the current Desktop thread creates a new local project thread with that prompt, then records the created thread id with `build-attach`. To force CLI from Desktop, pass `--launcher cli` or configure `CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND`.
+The build helper uses `guidance_map.py build --launcher auto`. `auto` first launches through `codex exec`, using a runnable `codex` command on PATH or `CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND` / `--codex-command`. Do not assume the Codex Desktop app installs a script-callable CLI for every user. If no CLI is available but the request is running inside Codex Desktop, `auto` prepares `desktop_manual_handoff_required`: a `.handoff.md` file, a short `codex://new?path=...&prompt=...` deep link, and attach/cleanup commands so the user can open a new local Desktop thread without pasting the full builder prompt. `--launcher desktop` remains an explicit handoff path for environments where a Codex Desktop thread creation tool is available.
 
 ## Usage
 
@@ -115,20 +118,37 @@ Use the guide before larger feature work:
 Use $code-project-guidance-map, then help me identify where this feature should be implemented.
 ```
 
+Use deterministic local routing without launching a builder:
+
+```powershell
+python <installed-skill>\scripts\guidance_map.py scan --repo .
+python <installed-skill>\scripts\guidance_map.py query "add an API controller" --repo .
+python <installed-skill>\scripts\guidance_map.py benchmark-build --repo .
+python <installed-skill>\scripts\guidance_map.py compare-graphify --repo . --query "add an API controller"
+```
+
+`scan` writes `.agents/guidance-map/project-map.json` with file-tree, language, manifest, module-candidate, import, changed-file, and graphify-availability summaries. `query` reads the signed manifest, scores guide-tree entries, verifies the selected guide content digests, and recommends guide paths, source paths, test paths, and optional graphify query commands without loading `graphify-out/graph.json` into context. Add `--run-graphify` only when you want the helper to run graphify query and capture bounded output. `benchmark-build` reports deterministic readiness, manifest size, guide-tree size, refresh scope, and latest builder metrics by default; pass `--start-build` only when you intentionally want it to launch the coordinated builder. `compare-graphify` puts CPGM project-map/tree-query metrics beside local graphify graph metadata and optional query evidence.
+
 ## Progressive Disclosure
 
-Generated guidance is intentionally layered. Later Codex sessions should start with the compact `AGENTS.md` index, use `Task Routing`, `Module Index`, and `verify.affected_modules` to choose relevant modules, then open only the matching module guide files. Module guides are lazy context, not startup context; ordinary tasks should usually read only 1-3 module guides before editing.
+Generated guidance is intentionally layered. Later Codex sessions should start with the compact `AGENTS.md` index, use `guidance_map.py query "<task>"`, and open only the manifest-verified guide files it recommends. Guide files are lazy context, not startup context; ordinary tasks should usually read only 1-5 guide files before editing.
 
-Module index entries can include optional lazy-read hints:
+Manifest guide entries include lazy-read hints:
 
 ```markdown
 - Read guide when: Editing hook behavior, hook state, hook tests, or hook config.
 - Usually skip when: Only changing helper signing, README copy, or plugin marketplace metadata.
 ```
 
-Hooks are read-only. They verify the current repository's guidance and add bounded context when the index or module guides are missing, stale, or unverifiable. Hook messages are state-machine driven: state is stored in the user's Codex home, but debounce decisions are scoped by project and session so one stale project does not silence another. By default, the same project/session/action is only reported once. After a code-edit-like prompt, `Stop` emits a continuation system message that tells Codex to call `guidance_map.py build --launcher auto` before finalizing. The helper either starts the single builder agent, prepares a Desktop builder thread handoff, or synchronizes the current thread context into the already active builder. Set `CODE_PROJECT_GUIDANCE_MAP_HOOK_LEVEL=off|error|stale|all` to tune hook noise.
+Hooks are read-only. They verify the current repository's guidance and add bounded context when the index or module guides are missing, stale, or unverifiable. Hook messages are state-machine driven: state is stored in the user's Codex home, but debounce decisions are scoped by project and session so one stale project does not silence another. By default, the same project/session/action is only reported once. After a code-edit-like prompt, `Stop` emits a continuation system message that tells Codex to call `guidance_map.py build --launcher auto` before finalizing. The helper either starts the single builder agent, prepares a Desktop manual/thread-tool handoff, or synchronizes the current thread context into the already active builder. Set `CODE_PROJECT_GUIDANCE_MAP_HOOK_LEVEL=off|error|stale|all` to tune hook noise.
 
-Subagents are mandatory for generation and refresh, but only inside the script-coordinated builder agent. Ordinary threads must not construct the map directly; they call `guidance_map.py build --launcher auto` and stop once the request is started, queued, or handed off to a Desktop-created builder thread. Module subagents write their assigned module guide files directly, but fan-out is capped and lifecycle-managed: by default the builder may run at most 3 module subagents at once and create at most 8 module subagents in one build pass. Treat those concurrent agents as worker slots. When a module task finishes, the builder must collect the result, then either reuse that same completed agent immediately for the next module task or close it immediately before moving on. Completed agents must not pile up until the end of the build. If a repository has more natural modules, the builder must merge related paths into coarser module groups instead of opening more terminals or agent panes. Tune this with `CODE_PROJECT_GUIDANCE_MAP_MAX_CONCURRENT_MODULE_SUBAGENTS`, `CODE_PROJECT_GUIDANCE_MAP_MAX_TOTAL_MODULE_SUBAGENTS`, or the matching `build` flags. The builder agent owns only the macro module map and the compact `AGENTS.md` index draft, then runs the helper to sign module files, backfill module signatures into the index, and write the aggregate signed `AGENTS.md` block. If coding changes make guidance stale, Codex should call the build helper immediately before the final response. If builder subagents are unavailable, the builder falls back to `plan-only`: it outputs the macro module map, affected files, bounded subagent scopes, and follow-up command, but does not read module internals or write guidance files.
+Subagents are mandatory for generation and refresh, but only inside the script-coordinated builder agent. Ordinary threads must not construct the map directly; they call `guidance_map.py build --launcher auto` and stop once the request is started, queued, or handed off to a Desktop builder thread. Module subagents write their assigned guide-tree files directly, but fan-out is capped and lifecycle-managed: by default the builder may run at most 3 module subagents at once and create at most 8 module subagents in one build pass. Treat those concurrent agents as worker slots. When a module task finishes, the builder must collect the result, then either reuse that same completed agent immediately for the next module task or close it immediately before moving on. Completed agents must not pile up until the end of the build. If a repository has more natural modules, the builder must choose a mixed-depth tree and merge related paths instead of opening more terminals or agent panes. Tune this with `CODE_PROJECT_GUIDANCE_MAP_MAX_CONCURRENT_MODULE_SUBAGENTS`, `CODE_PROJECT_GUIDANCE_MAP_MAX_TOTAL_MODULE_SUBAGENTS`, or the matching `build` flags. The builder agent owns only the macro guide tree and the compact `AGENTS.md` draft, then runs the helper to write the signed manifest, record guide content digests/source snapshots, and sign the aggregate `AGENTS.md` block. If coding changes make guidance stale, Codex should call the build helper immediately before the final response. If builder subagents are unavailable, the builder falls back to `plan-only`: it outputs the macro guide tree, affected files, bounded subagent scopes, and follow-up command, but does not read module internals or write guidance files.
+
+Builds write observable artifacts under the per-project build state `logs/` directory: `*.prompt.md`, `*.jsonl`, `*.last-message.md`, and `*.metrics.json`. Desktop handoff builds also write `*.handoff.md`. CLI launches wait briefly for a JSONL or last-message startup signal; if the process stays alive but writes nothing, the helper fails early with a diagnostic instead of leaving a silent builder lease behind. Tune that startup window with `CODE_PROJECT_GUIDANCE_MAP_BUILDER_STARTUP_HEALTH_SECONDS`.
+
+`verify` ignores common generated tool outputs such as `graphify-out/`, `node_modules/`, Python caches, Rust/JavaScript/.NET build directories, coverage output, and compiled bytecode. These paths are reported under `changed_files_by_source.tool_ignored` but do not make guidance stale.
+
+Manifest entries bind each guide file's content digest and deterministic source snapshot. `query` refuses to recommend a guide whose file content no longer matches the signed manifest. When source or manifest files under a guide's source globs change, that guide becomes the refresh target while unrelated guides can remain valid. Use `verify --full` when CI should validate every guide digest and source snapshot.
 
 ## Result
 
@@ -139,8 +159,8 @@ After a successful run, `AGENTS.md` contains a compact index like this:
 ## Code Project Guidance Map
 
 Generator: code-project-guidance-map
-Generator version: 0.2.1
-Guide format: action-map:v3
+Generator version: 0.3.0
+Guide format: action-map:v4
 Generated at: 2026-06-15T10:30:00Z
 Git baseline: abc1234
 Signature key id: repo:1a2b3c4d5e6f7890
@@ -156,9 +176,9 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 ### Progressive Disclosure
 
 - Start with this `AGENTS.md` index for broad orientation.
-- Read a module guide only when task routing, changed files, `verify.affected_modules`, or module index fields indicate that module is relevant.
-- Prefer reading 1-3 module guides before editing unless the task is explicitly cross-module or project-wide.
-- Do not open every linked module guide for ordinary orientation.
+- Use `guidance_map.py query "<task>"` before opening guide files.
+- Read only manifest-verified guide files returned by query unless the task is explicitly project-wide.
+- Do not open the whole guide tree for ordinary orientation.
 
 ### Task Routing
 
@@ -170,29 +190,24 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 - Shared utilities are the lowest-level code and must not depend on business, web, or persistence modules.
 - API modules call services; services own business rules; persistence modules own storage adapters and SQL.
 
-### Module Index
+### Guidance Manifest
 
-#### Scheduling
-
-- Module Path: `src/core/scheduling`
-- Module Guide: `.agents/guidance-map/modules/scheduling.md`
-- Module Signature: `hmac-sha256:<64 lowercase hex chars>`
-- Owns: Scheduling rules, shift rotation decisions, and scheduling-domain service behavior.
-- Change here when: A task changes how schedules are calculated, validated, or persisted through domain services.
-- Do not put here: HTTP response shaping, frontend-only DTOs, or generic shared helpers.
-- Read guide when: Editing scheduling rules, scheduling services, strategies, tests, or schedule persistence behavior.
-- Usually skip when: Only changing API response shaping, frontend DTOs, documentation, or generic shared helpers.
+Guidance manifest: `.agents/guidance-map/manifest.json`
+Guidance manifest digest: `sha256:<64 lowercase hex chars>`
 <!-- code-project-guidance-map:end -->
 ````
 
-The linked module file contains the detail:
+The signed manifest points at a mixed-depth guide tree:
 
 ````markdown
-<!-- code-project-guidance-map:module:start -->
-Signature: hmac-sha256:<64 lowercase hex chars>
-<!-- code-project-guidance-map:module:end -->
+<!-- code-project-guidance-map:guide:start -->
+Guide ID: scheduling.rules
+Guide kind: leaf
+Guide path: .agents/guidance-map/guides/scheduling/rules.md
+Parent guide ID: scheduling
+<!-- code-project-guidance-map:guide:end -->
 
-# Scheduling
+# Scheduling Rules
 
 - Module Path: `src/core/scheduling`
 - Owns: Scheduling rules, shift rotation decisions, and scheduling-domain service behavior.

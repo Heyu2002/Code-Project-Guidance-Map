@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,11 +28,19 @@ from typing import Any, Iterable
 START_MARKER = "<!-- code-project-guidance-map:start -->"
 END_MARKER = "<!-- code-project-guidance-map:end -->"
 GENERATOR = "code-project-guidance-map"
-GENERATOR_VERSION = "0.2.1"
-GUIDE_FORMAT = "action-map:v3"
+GENERATOR_VERSION = "0.3.0"
+GUIDE_FORMAT = "action-map:v4"
+LEGACY_GUIDE_FORMATS = {"action-map:v3"}
+SUPPORTED_GUIDE_FORMATS = {GUIDE_FORMAT, *LEGACY_GUIDE_FORMATS}
 SIGNATURE_ALGORITHM = "hmac-sha256:v2"
 MODULE_START_MARKER = "<!-- code-project-guidance-map:module:start -->"
 MODULE_END_MARKER = "<!-- code-project-guidance-map:module:end -->"
+TREE_GUIDE_START_MARKER = "<!-- code-project-guidance-map:guide:start -->"
+TREE_GUIDE_END_MARKER = "<!-- code-project-guidance-map:guide:end -->"
+PROJECT_MAP_RELATIVE_PATH = ".agents/guidance-map/project-map.json"
+MANIFEST_RELATIVE_PATH = ".agents/guidance-map/manifest.json"
+GUIDES_RELATIVE_DIR = ".agents/guidance-map/guides"
+GRAPHIFY_GRAPH_RELATIVE_PATH = "graphify-out/graph.json"
 SIGNATURE_SECRET_ENV = "CODE_PROJECT_GUIDANCE_MAP_SECRET"
 SIGNATURE_KEY_FILE_ENV = "CODE_PROJECT_GUIDANCE_MAP_KEY_FILE"
 SIGNATURE_KEY_HOME_ENV = "CODE_PROJECT_GUIDANCE_MAP_KEY_HOME"
@@ -40,12 +49,15 @@ BUILD_CODEX_COMMAND_ENV = "CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND"
 BUILD_CODEX_VALIDATE_ENV = "CODE_PROJECT_GUIDANCE_MAP_VALIDATE_CODEX"
 BUILD_LAUNCHER_ENV = "CODE_PROJECT_GUIDANCE_MAP_LAUNCHER"
 BUILD_DESKTOP_LAUNCH_GRACE_SECONDS_ENV = "CODE_PROJECT_GUIDANCE_MAP_DESKTOP_LAUNCH_GRACE_SECONDS"
+BUILD_STARTUP_HEALTH_SECONDS_ENV = "CODE_PROJECT_GUIDANCE_MAP_BUILDER_STARTUP_HEALTH_SECONDS"
 BUILD_STALE_SECONDS_ENV = "CODE_PROJECT_GUIDANCE_MAP_BUILD_STALE_SECONDS"
 BUILD_STATE_LOCK_TIMEOUT_ENV = "CODE_PROJECT_GUIDANCE_MAP_BUILD_STATE_LOCK_TIMEOUT"
 BUILD_MAX_CONCURRENT_MODULE_SUBAGENTS_ENV = "CODE_PROJECT_GUIDANCE_MAP_MAX_CONCURRENT_MODULE_SUBAGENTS"
 BUILD_MAX_TOTAL_MODULE_SUBAGENTS_ENV = "CODE_PROJECT_GUIDANCE_MAP_MAX_TOTAL_MODULE_SUBAGENTS"
+GRAPHIFY_COMMAND_ENV = "CODE_PROJECT_GUIDANCE_MAP_GRAPHIFY_COMMAND"
 DEFAULT_BUILD_STALE_SECONDS = 6 * 60 * 60
 DEFAULT_DESKTOP_LAUNCH_GRACE_SECONDS = 10 * 60
+DEFAULT_BUILD_STARTUP_HEALTH_SECONDS = 15.0
 DEFAULT_BUILD_STATE_LOCK_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_CONCURRENT_MODULE_SUBAGENTS = 3
 DEFAULT_MAX_TOTAL_MODULE_SUBAGENTS = 8
@@ -60,6 +72,8 @@ LOCAL_CHANGE_BASELINE_RE = re.compile(r"^Local change baseline:\s*(?P<value>.+?)
 SIGNATURE_KEY_ID_RE = re.compile(r"^Signature key id:\s*(?P<value>.+?)\s*$", re.MULTILINE)
 SIGNATURE_ALGORITHM_RE = re.compile(r"^Signature algorithm:\s*(?P<value>.+?)\s*$", re.MULTILINE)
 SIGNATURE_RE = re.compile(r"^Signature:\s*(?P<value>.+?)\s*$", re.MULTILINE)
+MANIFEST_PATH_RE = re.compile(r"^Guidance manifest:\s*(?P<value>.+?)\s*$", re.MULTILINE)
+MANIFEST_DIGEST_RE = re.compile(r"^Guidance manifest digest:\s*(?P<value>.+?)\s*$", re.MULTILINE)
 SECTION_HEADING_RE = re.compile(r"^### (?!#)(?P<title>.+?)\s*$", re.MULTILINE)
 MODULE_HEADING_RE = re.compile(r"^#### (?!#)(?P<title>.+?)\s*$", re.MULTILINE)
 REQUIRED_GUIDE_SECTIONS = (
@@ -162,6 +176,66 @@ CODE_PATTERNS = (
     "*.yaml",
     "*.yml",
 )
+LANGUAGE_BY_SUFFIX = {
+    ".java": "java",
+    ".kt": "kotlin",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".py": "python",
+    ".go": "go",
+    ".rs": "rust",
+    ".cs": "csharp",
+    ".php": "php",
+    ".rb": "ruby",
+    ".sql": "sql",
+    ".xml": "xml",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+}
+MANIFEST_PATTERNS = (
+    "pom.xml",
+    "**/pom.xml",
+    "build.gradle",
+    "**/build.gradle",
+    "build.gradle.kts",
+    "**/build.gradle.kts",
+    "settings.gradle",
+    "**/settings.gradle",
+    "settings.gradle.kts",
+    "**/settings.gradle.kts",
+    "package.json",
+    "**/package.json",
+    "pnpm-workspace.yaml",
+    "pyproject.toml",
+    "requirements*.txt",
+    "go.mod",
+    "Cargo.toml",
+    "*.sln",
+    "*.csproj",
+    "**/*.csproj",
+)
+IMPORT_PATTERNS_BY_SUFFIX = {
+    ".java": re.compile(r"^\s*import\s+(?:static\s+)?([A-Za-z_][\w.]*)(?:\.\*)?;", re.MULTILINE),
+    ".kt": re.compile(r"^\s*import\s+([A-Za-z_][\w.]*)(?:\.\*)?", re.MULTILINE),
+    ".py": re.compile(r"^\s*(?:from\s+([A-Za-z_][\w.]*)\s+import|import\s+([A-Za-z_][\w.]*))", re.MULTILINE),
+    ".rs": re.compile(r"^\s*use\s+([A-Za-z_][\w:]*)(?:::|\s*;|\s*\{)", re.MULTILINE),
+    ".cs": re.compile(r"^\s*using\s+([A-Za-z_][\w.]*);", re.MULTILINE),
+    ".go": re.compile(r"^\s*(?:import\s+)?\"([^\"]+)\"", re.MULTILINE),
+    ".ts": re.compile(r"from\s+['\"]([^'\"]+)['\"]|import\s+['\"]([^'\"]+)['\"]"),
+    ".tsx": re.compile(r"from\s+['\"]([^'\"]+)['\"]|import\s+['\"]([^'\"]+)['\"]"),
+    ".js": re.compile(r"from\s+['\"]([^'\"]+)['\"]|require\(['\"]([^'\"]+)['\"]\)"),
+    ".jsx": re.compile(r"from\s+['\"]([^'\"]+)['\"]|require\(['\"]([^'\"]+)['\"]\)"),
+}
+SCAN_MAX_FILES = 5000
+SCAN_MAX_IMPORT_FILES = 400
+SCAN_MAX_IMPORTS_PER_FILE = 12
+QUERY_MAX_MODULES = 3
+QUERY_MAX_GUIDES = 5
+MANIFEST_SCHEMA_VERSION = 1
+GRAPHIFY_QUERY_TIMEOUT_SECONDS = 60.0
+GRAPHIFY_OUTPUT_MAX_CHARS = 12000
 DOCS_PATTERNS = (
     "*.md",
     "README*",
@@ -172,6 +246,44 @@ DOCS_PATTERNS = (
 GENERATED_GUIDANCE_PATTERNS = (
     "AGENTS.md",
     ".agents/guidance-map/**",
+)
+TOOL_IGNORED_CHANGE_PATTERNS = (
+    "graphify-out/**",
+    "**/graphify-out/**",
+    "node_modules/**",
+    "**/node_modules/**",
+    ".pytest_cache/**",
+    "**/.pytest_cache/**",
+    "__pycache__/**",
+    "**/__pycache__/**",
+    ".mypy_cache/**",
+    "**/.mypy_cache/**",
+    ".ruff_cache/**",
+    "**/.ruff_cache/**",
+    ".next/**",
+    "**/.next/**",
+    ".turbo/**",
+    "**/.turbo/**",
+    ".venv/**",
+    "**/.venv/**",
+    "venv/**",
+    "**/venv/**",
+    "target/**",
+    "**/target/**",
+    "build/**",
+    "**/build/**",
+    "dist/**",
+    "**/dist/**",
+    "coverage/**",
+    "**/coverage/**",
+    "bin/**",
+    "**/bin/**",
+    "obj/**",
+    "**/obj/**",
+    "*.pyc",
+    "**/*.pyc",
+    "*.class",
+    "**/*.class",
 )
 DETACHED_BUILDER_PROCESSES: list[subprocess.Popen[str]] = []
 
@@ -298,6 +410,10 @@ def is_generated_guidance_path(path: str) -> bool:
     return matches_any(path, GENERATED_GUIDANCE_PATTERNS)
 
 
+def is_tool_ignored_change_path(path: str) -> bool:
+    return matches_any(path, TOOL_IGNORED_CHANGE_PATTERNS)
+
+
 def classify_changed_files(files: Iterable[str]) -> dict[str, list[str]]:
     impact = {
         "boundary_rules": [],
@@ -399,7 +515,7 @@ def local_change_baseline(repo: Path, git_available: bool) -> str:
     entries = {
         file: file_content_state(repo, file)
         for file in local_files
-        if not is_generated_guidance_path(file)
+        if not is_generated_guidance_path(file) and not is_tool_ignored_change_path(file)
     }
     return encode_local_change_baseline(entries)
 
@@ -417,6 +533,10 @@ def filter_baseline_ignored(files: Iterable[str], ignored: set[str]) -> list[str
     return [file for file in unique_ordered(files) if file not in ignored]
 
 
+def tool_ignored_files(files: Iterable[str]) -> list[str]:
+    return [file for file in unique_ordered(files) if is_tool_ignored_change_path(file)]
+
+
 def changed_files(
     repo: Path,
     git_available: bool,
@@ -430,6 +550,7 @@ def changed_files(
             "unstaged": [],
             "untracked": [],
             "baseline_ignored": [],
+            "tool_ignored": [],
             "all": [],
         }
 
@@ -443,7 +564,8 @@ def changed_files(
     untracked = git_files(repo, ["ls-files", "--others", "--exclude-standard"])
     all_files = unique_ordered([*committed, *staged, *unstaged, *untracked])
     ignored_list = baseline_ignored_files(repo, all_files, baseline or {})
-    ignored = set(ignored_list)
+    tool_ignored_list = tool_ignored_files(all_files)
+    ignored = {*ignored_list, *tool_ignored_list}
 
     return {
         "committed": filter_baseline_ignored(committed, ignored),
@@ -451,8 +573,266 @@ def changed_files(
         "unstaged": filter_baseline_ignored(unstaged, ignored),
         "untracked": filter_baseline_ignored(untracked, ignored),
         "baseline_ignored": ignored_list,
+        "tool_ignored": tool_ignored_list,
         "all": filter_baseline_ignored(all_files, ignored),
     }
+
+
+def project_map_path(root: Path) -> Path:
+    return root / PROJECT_MAP_RELATIVE_PATH
+
+
+def graphify_graph_path(root: Path) -> Path:
+    return root / GRAPHIFY_GRAPH_RELATIVE_PATH
+
+
+def split_tool_command(command: str | None, default: list[str]) -> list[str]:
+    configured = command or os.environ.get(GRAPHIFY_COMMAND_ENV)
+    if not configured:
+        return default
+    parts = shlex.split(configured, posix=os.name != "nt")
+    if not parts:
+        raise GuidanceMapError("Graphify command must not be empty.")
+    return parts
+
+
+def estimate_text_tokens(text: str) -> int:
+    return max(1, int(len(re.findall(r"\S+", text)) * 1.3)) if text.strip() else 0
+
+
+def graphify_graph_metadata(root: Path) -> dict[str, Any]:
+    graph_path = graphify_graph_path(root)
+    if not graph_path.exists():
+        return {
+            "available": False,
+            "graph_path": str(graph_path),
+            "size_bytes": 0,
+            "nodes": 0,
+            "links": 0,
+            "hyperedges": 0,
+            "communities": 0,
+        }
+    try:
+        data = json.loads(graph_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "available": True,
+            "graph_path": str(graph_path),
+            "size_bytes": file_size_or_zero(graph_path),
+            "error": f"Unable to parse graph JSON: {exc}",
+        }
+    nodes = data.get("nodes") if isinstance(data.get("nodes"), list) else []
+    links = data.get("links") if isinstance(data.get("links"), list) else data.get("edges")
+    links = links if isinstance(links, list) else []
+    hyperedges = data.get("hyperedges") if isinstance(data.get("hyperedges"), list) else []
+    communities = {
+        str(node.get("community"))
+        for node in nodes
+        if isinstance(node, dict) and node.get("community") is not None
+    }
+    return {
+        "available": True,
+        "graph_path": str(graph_path),
+        "size_bytes": file_size_or_zero(graph_path),
+        "nodes": len(nodes),
+        "links": len(links),
+        "hyperedges": len(hyperedges),
+        "communities": len(communities),
+        "format": "node-link" if "links" in data else ("raw-edges" if "edges" in data else "unknown"),
+    }
+
+
+def file_language(path: str) -> str | None:
+    return LANGUAGE_BY_SUFFIX.get(Path(path).suffix.casefold())
+
+
+def is_scan_ignored_path(path: str) -> bool:
+    normalized = path.strip().replace("\\", "/")
+    return (
+        not normalized
+        or normalized.startswith(".git/")
+        or normalized == ".git"
+        or is_generated_guidance_path(normalized)
+        or is_tool_ignored_change_path(normalized)
+    )
+
+
+def is_source_snapshot_path(path: str) -> bool:
+    return (matches_any(path, CODE_PATTERNS) or matches_any(path, MANIFEST_PATTERNS)) and not (
+        matches_any(path, DOCS_PATTERNS) or is_scan_ignored_path(path)
+    )
+
+
+def repo_files_for_scan(repo: Path, git_available: bool) -> list[str]:
+    if git_available:
+        files = unique_ordered(
+            [
+                *git_files(repo, ["ls-files"]),
+                *git_files(repo, ["ls-files", "--others", "--exclude-standard"]),
+            ]
+        )
+    else:
+        files = []
+        for path in repo.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                files.append(path.relative_to(repo).as_posix())
+            except ValueError:
+                continue
+    return [file for file in unique_ordered(files) if not is_scan_ignored_path(file)]
+
+
+def count_text_lines(path: Path) -> int:
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            return sum(1 for _ in handle)
+    except OSError:
+        return 0
+
+
+def read_import_sample(path: Path) -> str:
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            return handle.read(12000)
+    except OSError:
+        return ""
+
+
+def extract_imports(relpath: str, abs_path: Path) -> list[str]:
+    pattern = IMPORT_PATTERNS_BY_SUFFIX.get(Path(relpath).suffix.casefold())
+    if pattern is None:
+        return []
+    text = read_import_sample(abs_path)
+    imports: list[str] = []
+    for match in pattern.finditer(text):
+        value = next((group for group in match.groups() if group), "")
+        value = value.strip()
+        if value:
+            imports.append(value)
+        if len(imports) >= SCAN_MAX_IMPORTS_PER_FILE:
+            break
+    return unique_ordered(imports)
+
+
+def module_candidate_path(relpath: str) -> str:
+    parts = relpath.split("/")
+    if not parts:
+        return "."
+    if parts[0] in {"apps", "packages", "crates", "services", "modules"} and len(parts) >= 2:
+        return "/".join(parts[:2])
+    if parts[0] in {"src", "lib", "app", "cmd", "internal", "pkg"}:
+        if len(parts) >= 3 and parts[1] in {"main", "test", "tests"}:
+            return "/".join(parts[:3])
+        return parts[0]
+    return parts[0]
+
+
+def sorted_count_dict(counts: dict[str, int]) -> dict[str, int]:
+    return {key: counts[key] for key in sorted(counts, key=lambda item: (-counts[item], item))}
+
+
+def deterministic_project_scan(repo_arg: Path, verification: dict[str, object] | None = None) -> dict[str, Any]:
+    root, git_available = repo_root(repo_arg)
+    files = repo_files_for_scan(root, git_available)
+    truncated = len(files) > SCAN_MAX_FILES
+    scanned_files = files[:SCAN_MAX_FILES]
+    language_counts: dict[str, int] = {}
+    language_loc: dict[str, int] = {}
+    manifests: list[str] = []
+    top_level: dict[str, dict[str, Any]] = {}
+    module_candidates: dict[str, dict[str, Any]] = {}
+    imports: list[dict[str, Any]] = []
+
+    for relpath in scanned_files:
+        abs_path = root / relpath
+        language = file_language(relpath)
+        if language:
+            language_counts[language] = language_counts.get(language, 0) + 1
+            language_loc[language] = language_loc.get(language, 0) + count_text_lines(abs_path)
+        if matches_any(relpath, MANIFEST_PATTERNS):
+            manifests.append(relpath)
+
+        top = relpath.split("/", 1)[0] if "/" in relpath else "."
+        top_entry = top_level.setdefault(top, {"path": top, "file_count": 0, "source_file_count": 0, "languages": {}})
+        top_entry["file_count"] += 1
+        if language:
+            top_entry["source_file_count"] += 1
+            top_entry["languages"][language] = top_entry["languages"].get(language, 0) + 1
+
+        if language:
+            candidate = module_candidate_path(relpath)
+            module_entry = module_candidates.setdefault(
+                candidate,
+                {"path": candidate, "file_count": 0, "source_file_count": 0, "languages": {}, "manifests": []},
+            )
+            module_entry["file_count"] += 1
+            module_entry["source_file_count"] += 1
+            module_entry["languages"][language] = module_entry["languages"].get(language, 0) + 1
+            if matches_any(relpath, MANIFEST_PATTERNS):
+                module_entry["manifests"].append(relpath)
+
+        if language and len(imports) < SCAN_MAX_IMPORT_FILES:
+            extracted = extract_imports(relpath, abs_path)
+            if extracted:
+                imports.append({"file": relpath, "language": language, "imports": extracted})
+
+    graphify = graphify_graph_metadata(root)
+    changed_files = verification.get("changed_files") if isinstance(verification, dict) else None
+    affected_guides = verification.get("affected_module_guides") if isinstance(verification, dict) else None
+    return {
+        "schema_version": 1,
+        "generator": GENERATOR,
+        "generator_version": GENERATOR_VERSION,
+        "generated_at": utc_now(),
+        "repo_root": str(root),
+        "git_available": git_available,
+        "current_head": current_head(root, git_available),
+        "file_count": len(files),
+        "scanned_file_count": len(scanned_files),
+        "truncated": truncated,
+        "language_file_counts": sorted_count_dict(language_counts),
+        "language_loc": sorted_count_dict(language_loc),
+        "manifests": unique_ordered(manifests)[:200],
+        "top_level": sorted(top_level.values(), key=lambda item: (-int(item["file_count"]), str(item["path"])))[:100],
+        "module_candidates": sorted(
+            module_candidates.values(),
+            key=lambda item: (-int(item["source_file_count"]), str(item["path"])),
+        )[:80],
+        "imports": imports,
+        "changed_files": changed_files if isinstance(changed_files, list) else [],
+        "affected_module_guides": affected_guides if isinstance(affected_guides, list) else [],
+        "graphify": graphify,
+    }
+
+
+def write_project_map(repo_arg: Path, verification: dict[str, object] | None = None) -> dict[str, Any]:
+    root, _ = repo_root(repo_arg)
+    project_map = deterministic_project_scan(root, verification)
+    write_json_file(project_map_path(root), project_map)
+    return project_map
+
+
+def read_project_map(repo: Path) -> dict[str, Any]:
+    return read_json_file(project_map_path(repo))
+
+
+def module_source_snapshot(root: Path, module_path_raw: str) -> str:
+    _, git_available = repo_root(root)
+    files = repo_files_for_scan(root, git_available)
+    module_paths = module_path_values(module_path_raw)
+    tracked = [
+        file
+        for file in files
+        if is_source_snapshot_path(file) and (not module_paths or any(path_is_inside_module(file, module_path) for module_path in module_paths))
+    ]
+    digest = hashlib.sha256()
+    for relpath in sorted(tracked):
+        digest.update(relpath.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(file_content_state(root, relpath).encode("utf-8"))
+        digest.update(b"\0")
+    return f"sha256:{digest.hexdigest()}; files={len(tracked)}"
 
 
 def repo_identity(repo: Path, git_available: bool) -> str:
@@ -510,6 +890,10 @@ def build_state_mutex_path(state_dir: Path) -> Path:
     return state_dir / "state-write.lock"
 
 
+def build_metrics_path(state_dir: Path, build_id: str) -> Path:
+    return state_dir / "logs" / f"{build_id}.metrics.json"
+
+
 def read_json_file(path: Path) -> dict[str, Any]:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -523,6 +907,38 @@ def write_json_file(path: Path, payload: dict[str, Any]) -> None:
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
     tmp.replace(path)
+
+
+def canonical_json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def pretty_json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def sha256_text(text: str) -> str:
+    return f"sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()}"
+
+
+def sha256_bytes(data: bytes) -> str:
+    return f"sha256:{hashlib.sha256(data).hexdigest()}"
+
+
+def manifest_path(root: Path) -> Path:
+    return root / MANIFEST_RELATIVE_PATH
+
+
+def guides_dir(root: Path) -> Path:
+    return root / GUIDES_RELATIVE_DIR
+
+
+def guide_content_digest(text: str) -> str:
+    return sha256_text(text)
+
+
+def manifest_file_digest_from_text(text: str) -> str:
+    return sha256_text(text)
 
 
 def read_build_state(state_dir: Path, repo: Path, git_available: bool) -> dict[str, Any]:
@@ -541,6 +957,50 @@ def read_build_state(state_dir: Path, repo: Path, git_available: bool) -> dict[s
 
 def write_build_state(state_dir: Path, state: dict[str, Any]) -> None:
     write_json_file(build_state_path(state_dir), state)
+
+
+def verification_metrics(verification: dict[str, object]) -> dict[str, Any]:
+    changed_files = verification.get("changed_files")
+    affected_guides = verification.get("affected_module_guides")
+    affected_tree_guides = verification.get("affected_guides")
+    modules = verification.get("modules")
+    tampered_guides = verification.get("tampered_guides")
+    stale_guides = verification.get("stale_guides")
+    return {
+        "recommended_action": verification.get("recommended_action"),
+        "severity": verification.get("severity"),
+        "has_block": verification.get("has_block"),
+        "guide_format": verification.get("guide_format"),
+        "manifest_valid": verification.get("manifest_valid"),
+        "manifest_digest_matches_agents": verification.get("manifest_digest_matches_agents"),
+        "modules_valid": verification.get("modules_valid"),
+        "changed_file_count": len(changed_files) if isinstance(changed_files, list) else 0,
+        "affected_module_guide_count": len(affected_guides) if isinstance(affected_guides, list) else 0,
+        "affected_tree_guide_count": len(affected_tree_guides) if isinstance(affected_tree_guides, list) else 0,
+        "checked_guide_count": verification.get("checked_guide_count"),
+        "tampered_guide_count": len(tampered_guides) if isinstance(tampered_guides, list) else 0,
+        "stale_guide_count": len(stale_guides) if isinstance(stale_guides, list) else 0,
+        "module_count": len(modules) if isinstance(modules, list) else 0,
+    }
+
+
+def write_build_metrics(path: Path, payload: dict[str, Any]) -> None:
+    write_json_file(path, payload)
+
+
+def update_build_metrics(path: Path | None, updates: dict[str, Any]) -> None:
+    if path is None:
+        return
+    payload = read_json_file(path)
+    payload.update(updates)
+    write_build_metrics(path, payload)
+
+
+def build_duration_seconds(active: dict[str, Any]) -> float | None:
+    started_at = parse_timestamp_seconds(str(active.get("started_at") or ""))
+    if started_at is None:
+        return None
+    return round(time.time() - started_at, 3)
 
 
 def env_float(name: str, default: float) -> float:
@@ -592,7 +1052,7 @@ def active_build_is_live(active: dict[str, Any] | None) -> bool:
     age = (time.time() - started_at) if started_at is not None else None
     if status_value == "launching" and age is not None and age < BUILD_LAUNCH_GRACE_SECONDS:
         return True
-    if status_value == "desktop_launch_required" and age is not None:
+    if status_value in {"desktop_launch_required", "desktop_manual_handoff_required"} and age is not None:
         desktop_launch_grace = env_float(BUILD_DESKTOP_LAUNCH_GRACE_SECONDS_ENV, float(DEFAULT_DESKTOP_LAUNCH_GRACE_SECONDS))
         return age < desktop_launch_grace
     pid_value = active.get("pid")
@@ -777,6 +1237,7 @@ def builder_prompt(
     verification: dict[str, object],
     request_context: dict[str, Any],
     state_dir: Path,
+    project_map_file: Path,
     max_concurrent_module_subagents: int,
     max_total_module_subagents: int,
 ) -> str:
@@ -785,18 +1246,20 @@ def builder_prompt(
 Repository: {repo}
 Build id: {build_id}
 Build state directory: {state_dir}
+Deterministic project map: {project_map_file}
 
 This is the only mode allowed to construct or refresh the guidance map. Do not run `guidance_map.py build` and do not start another builder. Other Codex threads synchronize context through the build state while you own this lease.
 
 Your task:
 1. Read the local `code-project-guidance-map` skill instructions. Because this prompt was launched by `guidance_map.py build`, operate in Builder Agent Mode: perform the direct map construction workflow in this agent instead of delegating back to `build`.
-2. Run `python {script_path} status --repo {repo}` and `python {script_path} verify --repo {repo}`.
-3. If the guidance is current and no refresh was explicitly requested, release the lease with `python {script_path} build-finish --repo {repo} --build-id {build_id} --status complete`.
-4. For generate, full refresh, or incremental refresh work, use bounded module subagents exactly as the skill requires and obey the hard resource limits below. The main builder owns only shallow scanning, macro module boundaries, index integration, and final helper commands.
-5. Write module guides, create the temporary index draft, then run `python {script_path} update --repo {repo} --guidance-file <temp-index.md>`.
-6. Validate with `python {script_path} status --repo {repo}`.
-7. Before finalizing, run `python {script_path} build-drain --repo {repo} --build-id {build_id}`. If it returns pending contexts, fold them into your working context, re-run `verify`, and perform another build pass. Repeat until `pending_contexts` is empty.
-8. Release the lease only after the final pass with `python {script_path} build-finish --repo {repo} --build-id {build_id} --status complete`. If you cannot complete, run the same command with `--status failed --message <reason>`.
+2. Read `{project_map_file}` before any source-level exploration. Treat it as the deterministic pre-scan for file tree, language mix, manifests, module candidates, imports, changed files, and graphify availability.
+3. Run `python {script_path} status --repo {repo}` and `python {script_path} verify --repo {repo}`.
+4. If the guidance is current and no refresh was explicitly requested, release the lease with `python {script_path} build-finish --repo {repo} --build-id {build_id} --status complete`.
+5. For generate, full refresh, or incremental refresh work, use bounded module subagents exactly as the skill requires and obey the hard resource limits below. The main builder owns only shallow scanning, macro module boundaries, index integration, and final helper commands.
+6. Write module guides, create the temporary index draft, then run `python {script_path} update --repo {repo} --guidance-file <temp-index.md>`.
+7. Validate with `python {script_path} status --repo {repo}`.
+8. Before finalizing, run `python {script_path} build-drain --repo {repo} --build-id {build_id}`. If it returns pending contexts, fold them into your working context, re-run `verify`, and perform another build pass. Repeat until `pending_contexts` is empty.
+9. Release the lease only after the final pass with `python {script_path} build-finish --repo {repo} --build-id {build_id} --status complete`. If you cannot complete, run the same command with `--status failed --message <reason>`.
 
 Module subagent resource limits:
 - Maximum module subagents running at the same time: {max_concurrent_module_subagents}
@@ -812,6 +1275,9 @@ Module subagent lifecycle rules:
 - If you do not reuse that completed agent immediately, close it immediately before starting or waiting on other module work. Completed agents must not remain open until the end of the build.
 - If a reused agent completes its final assigned module, close it immediately after collecting its result.
 - Before final validation and build-finish, close every module subagent that is still open.
+
+Graphify integration:
+- If the project map reports `graphify.available=true`, you may run `graphify query/path` as dependency or impact evidence. Do not read `graphify-out/graph.json` directly into model context.
 
 Initial verification JSON:
 ```json
@@ -859,7 +1325,7 @@ def validate_default_codex(command: list[str]) -> None:
         )
         raise GuidanceMapError(
             "Unable to run `codex --version` for the CLI launcher; use a runnable Codex CLI command on PATH, "
-            "CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND/--codex-command, or `guidance_map.py build --launcher auto` from Codex Desktop."
+            "or set CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND/--codex-command to a runnable Codex CLI binary."
             f"{desktop_note}"
         ) from exc
     if result.returncode != 0:
@@ -884,8 +1350,8 @@ def resolve_codex_command(codex_command: str | None) -> list[str]:
             else ""
         )
         raise GuidanceMapError(
-            "Unable to find a runnable `codex` command for the CLI launcher. The build helper can use Codex CLI, including "
-            "a Desktop-provided command alias, or `guidance_map.py build --launcher auto` can hand off from Codex Desktop."
+            "Unable to find a runnable `codex` command for the CLI launcher. Install Codex CLI so `codex` is on PATH, "
+            "or set CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND/--codex-command to a runnable Codex CLI binary."
             f"{desktop_note}"
         )
     command = [executable]
@@ -911,14 +1377,12 @@ def resolve_build_launcher(launcher: str | None, codex_command: str | None) -> t
         if not desktop_launcher_available():
             return "desktop", None, "Desktop launcher was requested; create_thread must be available in the current Codex app thread."
         return "desktop", None, None
-    if launcher_value == "auto" and desktop_launcher_available() and not explicit_command:
-        return "desktop", None, "Codex Desktop environment detected; using Desktop builder handoff."
 
     try:
         return "cli", resolve_codex_command(codex_command), None
     except GuidanceMapError as exc:
         if launcher_value == "auto" and not explicit_command and desktop_launcher_available():
-            return "desktop", None, str(exc)
+            return "desktop_manual", None, str(exc)
         raise
 
 
@@ -940,6 +1404,79 @@ def windows_hidden_startupinfo() -> Any | None:
     return startupinfo
 
 
+def path_has_content(path: Path) -> bool:
+    try:
+        return path.exists() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def file_tail(path: Path, max_chars: int = 2000) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return text[-max_chars:]
+
+
+def builder_startup_health_seconds() -> float:
+    return env_float(BUILD_STARTUP_HEALTH_SECONDS_ENV, DEFAULT_BUILD_STARTUP_HEALTH_SECONDS)
+
+
+def builder_process_exited(process: subprocess.Popen[str]) -> bool:
+    try:
+        return process.poll() is not None
+    except OSError:
+        if os.name != "nt":
+            raise
+        return False
+
+
+def wait_for_builder_startup(
+    process: subprocess.Popen[str],
+    log_file: Path,
+    last_message_file: Path,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    if timeout_seconds <= 0:
+        return {
+            "startup_signal": "skipped",
+            "health_check_seconds": 0,
+            "checked_at": utc_now(),
+        }
+
+    started = time.time()
+    deadline = started + timeout_seconds
+    while True:
+        if builder_process_exited(process):
+            tail = file_tail(log_file)
+            detail = f" Last log output: {tail}" if tail else f" Log file is empty: {log_file}"
+            raise GuidanceMapError(
+                f"Builder agent exited during startup with code {process.returncode}.{detail}"
+            )
+        if path_has_content(last_message_file):
+            return {
+                "startup_signal": "last_message",
+                "health_check_seconds": round(time.time() - started, 3),
+                "checked_at": utc_now(),
+            }
+        if path_has_content(log_file):
+            return {
+                "startup_signal": "jsonl_log",
+                "health_check_seconds": round(time.time() - started, 3),
+                "checked_at": utc_now(),
+            }
+        if time.time() >= deadline:
+            break
+        time.sleep(0.2)
+
+    raise GuidanceMapError(
+        "Builder agent produced no startup output within "
+        f"{timeout_seconds:g}s. The JSONL log is still empty and no last-message file was written: {log_file}. "
+        "Check the Codex command, Windows shell shim behavior, auth/session state, and whether the process can read stdin."
+    )
+
+
 def launch_builder_agent(
     repo: Path,
     build_id: str,
@@ -949,6 +1486,7 @@ def launch_builder_agent(
     model: str | None,
     extra_args: list[str],
     resolved_command: list[str] | None = None,
+    startup_health_seconds: float | None = None,
 ) -> dict[str, Any]:
     command = resolved_command or resolve_codex_command(codex_command)
 
@@ -999,15 +1537,12 @@ def launch_builder_agent(
             creationflags=creationflags,
             startupinfo=startupinfo,
         )
-        time.sleep(0.2)
-        try:
-            exited = process.poll() is not None
-        except OSError:
-            if os.name != "nt":
-                raise
-            exited = False
-        if exited:
-            raise GuidanceMapError(f"Builder agent exited during startup with code {process.returncode}. See {log_file}.")
+        startup_health = wait_for_builder_startup(
+            process,
+            log_file,
+            last_message_file,
+            builder_startup_health_seconds() if startup_health_seconds is None else startup_health_seconds,
+        )
         DETACHED_BUILDER_PROCESSES.append(process)
         return {
             "pid": process.pid,
@@ -1015,6 +1550,7 @@ def launch_builder_agent(
             "prompt_file": str(prompt_file),
             "log_file": str(log_file),
             "last_message_file": str(last_message_file),
+            "startup_health": startup_health,
         }
     except OSError as exc:
         raise GuidanceMapError(f"Unable to launch builder agent: {exc}") from exc
@@ -1022,6 +1558,71 @@ def launch_builder_agent(
         if stdin_handle is not None:
             stdin_handle.close()
         log_handle.close()
+
+
+def desktop_manual_thread_id(build_id: str) -> str:
+    return f"desktop-manual-{build_id[:12]}"
+
+
+def desktop_handoff_prompt(handoff_file: Path) -> str:
+    return f"Read and execute this Code Project Guidance Map Desktop handoff file: {handoff_file}"
+
+
+def codex_new_thread_link(repo: Path, prompt: str) -> str:
+    query = urllib.parse.urlencode(
+        {
+            "path": str(repo),
+            "prompt": prompt,
+        },
+        quote_via=urllib.parse.quote,
+    )
+    return f"codex://new?{query}"
+
+
+def render_desktop_handoff(
+    repo: Path,
+    build_id: str,
+    script_path: Path,
+    state_dir: Path,
+    prompt_file: Path,
+    attach_command: str,
+    finish_failed_command: str,
+    module_subagent_limits: dict[str, int],
+    mode: str,
+) -> str:
+    return f"""# Code Project Guidance Map Desktop Handoff
+
+Repository: `{repo}`
+Build id: `{build_id}`
+Mode: `{mode}`
+State directory: `{state_dir}`
+Builder prompt file: `{prompt_file}`
+
+## First command
+
+Run this before reading the full builder prompt:
+
+```powershell
+{attach_command}
+```
+
+## Then execute the builder prompt
+
+Read `{prompt_file}` and follow it as the active task. Do not run `guidance_map.py build` again from this builder thread.
+
+Module subagent limits:
+
+- Maximum concurrent module subagents: {module_subagent_limits["max_concurrent_module_subagents"]}
+- Maximum total module subagents: {module_subagent_limits["max_total_module_subagents"]}
+
+When the build completes, the builder prompt tells you to run `build-drain` until no pending context remains and then `build-finish --status complete`.
+
+If you cannot complete the build, release the lease with:
+
+```powershell
+{finish_failed_command}
+```
+"""
 
 
 def start_guidance_build(
@@ -1071,47 +1672,142 @@ def start_guidance_build(
         launcher_value, resolved_command, launcher_note = resolve_build_launcher(launcher, codex_command)
         build_id = uuid.uuid4().hex
         started_at = utc_now()
-        prompt = builder_prompt(root, build_id, script_path, verification, request_context, state_dir, max_concurrent, max_total)
+        project_map = write_project_map(root, verification)
+        project_map_file = project_map_path(root)
+        prompt = builder_prompt(
+            root,
+            build_id,
+            script_path,
+            verification,
+            request_context,
+            state_dir,
+            project_map_file,
+            max_concurrent,
+            max_total,
+        )
+        metrics_file = build_metrics_path(state_dir, build_id)
+        desktop_handoff_status = (
+            "desktop_manual_handoff_required" if launcher_value == "desktop_manual" else "desktop_launch_required"
+        )
         active = {
             "build_id": build_id,
             "repo_root": str(root),
             "project_id": project_id(root, git_available),
-            "status": "launching" if launcher_value == "cli" else "desktop_launch_required",
-            "launcher": launcher_value,
+            "status": "launching" if launcher_value == "cli" else desktop_handoff_status,
+            "launcher": "cli" if launcher_value == "cli" else "desktop",
+            "handoff_mode": "manual" if launcher_value == "desktop_manual" else ("thread_tool" if launcher_value == "desktop" else None),
             "started_at": started_at,
             "pid": None,
             "module_subagent_limits": subagent_limits,
+            "metrics_file": str(metrics_file),
         }
         state["active"] = active
         state.setdefault("pending_contexts", [])
+        write_build_metrics(
+            metrics_file,
+            {
+                "build_id": build_id,
+                "repo_root": str(root),
+                "project_id": project_id(root, git_available),
+                "status": active["status"],
+                "launcher": active["launcher"],
+                "handoff_mode": active.get("handoff_mode"),
+                "started_at": started_at,
+                "module_subagent_limits": subagent_limits,
+                "verification": verification_metrics(verification),
+                "project_map_file": str(project_map_file),
+                "project_map": {
+                    "file_count": project_map.get("file_count"),
+                    "scanned_file_count": project_map.get("scanned_file_count"),
+                    "language_file_counts": project_map.get("language_file_counts"),
+                    "module_candidate_count": len(project_map.get("module_candidates", []))
+                    if isinstance(project_map.get("module_candidates"), list)
+                    else 0,
+                    "graphify": project_map.get("graphify"),
+                },
+            },
+        )
         write_active_lock(state_dir, active)
         write_build_state(state_dir, state)
 
-        if launcher_value == "desktop":
+        if launcher_value in {"desktop", "desktop_manual"}:
             log_dir = state_dir / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
             prompt_file = log_dir / f"{build_id}.prompt.md"
+            handoff_file = log_dir / f"{build_id}.handoff.md"
             write_text(prompt_file, prompt)
-            active["prompt_file"] = str(prompt_file)
+            manual = launcher_value == "desktop_manual"
+            attach_thread_id = desktop_manual_thread_id(build_id) if manual else "<created-thread-id>"
+            attach_command = f"python {script_path} build-attach --repo {root} --build-id {build_id} --thread-id {attach_thread_id}"
+            finish_failed_command = f"python {script_path} build-finish --repo {root} --build-id {build_id} --status failed --force --message <reason>"
+            write_text(
+                handoff_file,
+                render_desktop_handoff(
+                    root,
+                    build_id,
+                    script_path,
+                    state_dir,
+                    prompt_file,
+                    attach_command,
+                    finish_failed_command,
+                    subagent_limits,
+                    "manual" if manual else "thread-tool",
+                ),
+            )
+            handoff_prompt = desktop_handoff_prompt(handoff_file)
+            desktop_link = codex_new_thread_link(root, handoff_prompt)
+            active.update(
+                {
+                    "status": desktop_handoff_status,
+                    "prompt_file": str(prompt_file),
+                    "handoff_file": str(handoff_file),
+                    "desktop_deep_link": desktop_link,
+                    "attach_command": attach_command,
+                    "finish_failed_command": finish_failed_command,
+                }
+            )
             if launcher_note:
                 active["launcher_note"] = launcher_note
+            update_build_metrics(
+                metrics_file,
+                {
+                    "status": desktop_handoff_status,
+                    "prompt_file": str(prompt_file),
+                    "handoff_file": str(handoff_file),
+                    "desktop_deep_link": desktop_link,
+                    "launcher_note": launcher_note,
+                },
+            )
             write_active_lock(state_dir, active)
             write_build_state(state_dir, state)
             return {
-                "status": "desktop_launch_required",
+                "status": desktop_handoff_status,
                 "repo_root": str(root),
                 "project_id": project_id(root, git_available),
                 "build_id": build_id,
                 "launcher": "desktop",
+                "handoff_mode": "manual" if manual else "thread_tool",
                 "state_file": str(build_state_path(state_dir)),
+                "metrics_file": str(metrics_file),
+                "project_map_file": str(project_map_file),
                 "prompt_file": str(prompt_file),
-                "prompt": prompt,
+                "handoff_file": str(handoff_file),
+                "handoff_prompt": handoff_prompt,
+                "desktop_deep_link": desktop_link,
+                "prompt": prompt if not manual else None,
                 "module_subagent_limits": subagent_limits,
-                "attach_command": f"python {script_path} build-attach --repo {root} --build-id {build_id} --thread-id <created-thread-id>",
-                "finish_failed_command": f"python {script_path} build-finish --repo {root} --build-id {build_id} --status failed --force --message <reason>",
+                "attach_command": attach_command,
+                "finish_failed_command": finish_failed_command,
                 "message": (
-                    "No runnable CLI builder was launched. In Codex Desktop, create a new local project thread with the returned prompt, "
-                    "then run build-attach with the created thread id. The lease prevents another map builder from starting meanwhile."
+                    (
+                        "Codex CLI was unavailable, so the build lease was prepared for a Desktop-only manual handoff. "
+                        "Open the desktop_deep_link or create a new local project thread with handoff_prompt; the new thread will read the handoff file, attach with the manual thread id, and execute the builder prompt."
+                    )
+                    if manual
+                    else (
+                        "No runnable CLI builder was launched. In Codex Desktop, create a new local project thread with the returned prompt or handoff file, "
+                        "then run build-attach with the created thread id. The lease prevents another map builder from starting meanwhile."
+                    )
                 ),
             }
 
@@ -1127,6 +1823,14 @@ def start_guidance_build(
                 resolved_command=resolved_command,
             )
         except GuidanceMapError:
+            update_build_metrics(
+                metrics_file,
+                {
+                    "status": "launch_failed",
+                    "finished_at": utc_now(),
+                    "duration_seconds": build_duration_seconds(active),
+                },
+            )
             clear_active_build(state_dir, state, "launch_failed", "Builder agent failed to start.")
             write_build_state(state_dir, state)
             raise
@@ -1140,7 +1844,20 @@ def start_guidance_build(
                 "prompt_file": launch["prompt_file"],
                 "log_file": launch["log_file"],
                 "last_message_file": launch["last_message_file"],
+                "startup_health": launch["startup_health"],
             }
+        )
+        update_build_metrics(
+            metrics_file,
+            {
+                "status": "running",
+                "pid": launch["pid"],
+                "command": launch["command"],
+                "prompt_file": launch["prompt_file"],
+                "log_file": launch["log_file"],
+                "last_message_file": launch["last_message_file"],
+                "startup_health": launch["startup_health"],
+            },
         )
         write_active_lock(state_dir, active)
         write_build_state(state_dir, state)
@@ -1152,9 +1869,12 @@ def start_guidance_build(
             "launcher": "cli",
             "pid": launch["pid"],
             "state_file": str(build_state_path(state_dir)),
+            "metrics_file": str(metrics_file),
+            "project_map_file": str(project_map_file),
             "prompt_file": launch["prompt_file"],
             "log_file": launch["log_file"],
             "last_message_file": launch["last_message_file"],
+            "startup_health": launch["startup_health"],
             "module_subagent_limits": subagent_limits,
             "message": "Builder agent started; guidance_map.py build is exiting now.",
         }
@@ -1178,6 +1898,16 @@ def attach_desktop_builder_thread(repo_arg: Path, build_id: str, thread_id: str)
             }
         )
         state["active"] = active
+        metrics_file_value = active.get("metrics_file")
+        metrics_path = Path(str(metrics_file_value)) if metrics_file_value else None
+        update_build_metrics(
+            metrics_path,
+            {
+                "status": "running",
+                "thread_id": thread_id,
+                "attached_at": active["attached_at"],
+            },
+        )
         write_active_lock(state_dir, active)
         write_build_state(state_dir, state)
         return {
@@ -1185,6 +1915,7 @@ def attach_desktop_builder_thread(repo_arg: Path, build_id: str, thread_id: str)
             "repo_root": str(root),
             "build_id": build_id,
             "thread_id": thread_id,
+            "metrics_file": str(metrics_path) if metrics_path else None,
             "state_file": str(build_state_path(state_dir)),
             "message": "Desktop builder thread attached; guidance_map.py build coordination can stop in the caller thread.",
         }
@@ -1228,6 +1959,19 @@ def finish_guidance_build(
         pending = state.get("pending_contexts") if isinstance(state.get("pending_contexts"), list) else []
         if pending and not force:
             raise GuidanceMapError("Pending build context exists; run build-drain and perform another build pass before finishing.")
+        metrics_file_value = active.get("metrics_file")
+        metrics_path = Path(str(metrics_file_value)) if metrics_file_value else None
+        update_build_metrics(
+            metrics_path,
+            {
+                "status": "finished",
+                "finish_status": status_value,
+                "finished_at": utc_now(),
+                "duration_seconds": build_duration_seconds(active),
+                "pending_context_count": len(pending),
+                "finish_message": message,
+            },
+        )
         clear_active_build(state_dir, state, status_value, message)
         write_build_state(state_dir, state)
         return {
@@ -1236,6 +1980,7 @@ def finish_guidance_build(
             "repo_root": str(root),
             "build_id": build_id,
             "pending_context_count": len(pending),
+            "metrics_file": str(metrics_path) if metrics_path else None,
             "state_file": str(build_state_path(state_dir)),
         }
 
@@ -1387,7 +2132,7 @@ def signature_is_valid(
     ):
         return False
     effective_algorithm = algorithm or (SIGNATURE_ALGORITHM if signature.startswith("hmac-sha256:") else None)
-    if guide_format != GUIDE_FORMAT or effective_algorithm != SIGNATURE_ALGORITHM or not signature.startswith("hmac-sha256:"):
+    if guide_format not in SUPPORTED_GUIDE_FORMATS or effective_algorithm != SIGNATURE_ALGORITHM or not signature.startswith("hmac-sha256:"):
         return False
     guidance = guidance_body_from_block(block)
     if guidance is None:
@@ -1502,9 +2247,511 @@ def module_index_descriptors(root: Path, guidance: str) -> list[dict[str, str]]:
                 "read_guide_when": field_value(module_body, "Read guide when") or "",
                 "usually_skip_when": field_value(module_body, "Usually skip when") or "",
                 "signature": strip_inline_code(field_value(module_body, "Module Signature") or ""),
+                "source_snapshot": strip_inline_code(field_value(module_body, "Module Source Snapshot") or ""),
             }
         )
     return descriptors
+
+
+def remove_top_level_section(guidance: str, title: str) -> str:
+    span = section_span(guidance, title)
+    if span is None:
+        return guidance.strip()
+    _, body_end, match = span
+    before = guidance[: match.start()].rstrip()
+    after = guidance[body_end:].lstrip()
+    pieces = [piece for piece in (before, after) if piece]
+    return "\n\n".join(pieces).strip()
+
+
+def split_list_field(value: str | None) -> list[str]:
+    if not value:
+        return []
+    inline_values = re.findall(r"`([^`]+)`", value)
+    raw_values = inline_values if inline_values else re.split(r"[,;]", value)
+    return unique_ordered(raw_values)
+
+
+def guide_id_slug(value: str) -> str:
+    tokens = re.findall(r"[A-Za-z0-9]+", value.casefold())
+    return ".".join(tokens) or "guide"
+
+
+def guide_path_from_id(guide_id: str, kind: str = "leaf") -> str:
+    parts = [part for part in guide_id.split(".") if part]
+    if not parts:
+        parts = ["guide"]
+    if kind == "parent":
+        return f"{GUIDES_RELATIVE_DIR}/{'/'.join(parts)}/index.md"
+    if len(parts) == 1:
+        return f"{GUIDES_RELATIVE_DIR}/{parts[0]}.md"
+    return f"{GUIDES_RELATIVE_DIR}/{'/'.join(parts)}.md"
+
+
+def normalize_guide_kind(value: str | None, guide_path: str) -> str:
+    raw = (value or "").strip().casefold()
+    if raw in {"parent", "leaf"}:
+        return raw
+    return "parent" if guide_path.replace("\\", "/").endswith("/index.md") else "leaf"
+
+
+def module_paths_to_source_globs(module_path_raw: str) -> list[str]:
+    globs: list[str] = []
+    for value in module_path_values(module_path_raw):
+        normalized = value.strip().replace("\\", "/").rstrip("/") or "."
+        if normalized == ".":
+            globs.append("**/*")
+        elif any(char in normalized for char in "*?[]"):
+            globs.append(normalized)
+        elif Path(normalized).suffix:
+            globs.append(normalized)
+        else:
+            globs.append(f"{normalized}/**")
+    return unique_ordered(globs)
+
+
+def resolve_tree_guide_path(root: Path, raw: str, field: str) -> Path:
+    cleaned = strip_inline_code(raw)
+    if not cleaned:
+        raise GuidanceMapError(f"{field} must not be empty.")
+    path = Path(cleaned)
+    resolved = path.resolve() if path.is_absolute() else (root / path).resolve()
+    guide_root = guides_dir(root).resolve()
+    if resolved != guide_root and guide_root not in resolved.parents:
+        raise GuidanceMapError(f"{field} path must stay inside {GUIDES_RELATIVE_DIR}: {cleaned}")
+    return resolved
+
+
+def safe_tree_guide_relpath(root: Path, raw: str, field: str) -> str:
+    return repo_relative(root, resolve_tree_guide_path(root, raw, field))
+
+
+def guide_index_descriptors(root: Path, guidance: str) -> list[dict[str, Any]]:
+    guide_index = top_level_section_body(guidance, "Guide Index") or ""
+    guide_entries = module_entries(guide_index)
+    if guide_entries:
+        descriptors: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        seen_paths: set[str] = set()
+        for title, body in guide_entries:
+            guide_id = strip_inline_code(field_value(body, "Guide ID") or "") or guide_id_slug(title)
+            if guide_id in seen_ids:
+                raise GuidanceMapError(f"Guide ID is reused by more than one guide: {guide_id}")
+            seen_ids.add(guide_id)
+            guide_path_value = field_value(body, "Guide Path") or guide_path_from_id(
+                guide_id,
+                strip_inline_code(field_value(body, "Guide Kind") or "leaf").casefold(),
+            )
+            guide_rel = safe_tree_guide_relpath(root, guide_path_value, f"Guide '{title}' Guide Path")
+            if guide_rel in seen_paths:
+                raise GuidanceMapError(f"Guide Path is reused by more than one guide: {guide_rel}")
+            seen_paths.add(guide_rel)
+            source_globs = split_list_field(field_value(body, "Source Globs"))
+            module_path = field_value(body, "Module Path") or field_value(body, "Source Paths") or ""
+            if not source_globs:
+                source_globs = module_paths_to_source_globs(module_path)
+            kind = normalize_guide_kind(field_value(body, "Guide Kind"), guide_rel)
+            descriptors.append(
+                {
+                    "id": guide_id,
+                    "title": title,
+                    "parent_id": strip_inline_code(field_value(body, "Parent Guide ID") or "") or None,
+                    "path": guide_rel,
+                    "kind": kind,
+                    "module_path": module_path,
+                    "source_globs": source_globs,
+                    "tags": split_list_field(field_value(body, "Tags")),
+                    "read_when": field_value(body, "Read guide when") or "",
+                    "skip_when": field_value(body, "Usually skip when") or "",
+                    "owns": field_value(body, "Owns") or "",
+                    "change_here_when": field_value(body, "Change here when") or "",
+                    "do_not_put_here": field_value(body, "Do not put here") or "",
+                    "source_guide_path": None,
+                }
+            )
+        return descriptors
+
+    module_descriptors = module_index_descriptors(root, guidance)
+    converted: list[dict[str, Any]] = []
+    for descriptor in module_descriptors:
+        guide_id = guide_id_slug(descriptor["name"])
+        guide_rel = guide_path_from_id(guide_id)
+        converted.append(
+            {
+                "id": guide_id,
+                "title": descriptor["name"],
+                "parent_id": None,
+                "path": guide_rel,
+                "kind": "leaf",
+                "module_path": descriptor.get("module_path", ""),
+                "source_globs": module_paths_to_source_globs(descriptor.get("module_path", "")),
+                "tags": sorted(
+                    query_tokens(
+                        " ".join(
+                            [
+                                descriptor.get("name", ""),
+                                descriptor.get("owns", ""),
+                                descriptor.get("change_here_when", ""),
+                            ]
+                        )
+                    )
+                ),
+                "read_when": descriptor.get("read_guide_when", ""),
+                "skip_when": descriptor.get("usually_skip_when", ""),
+                "owns": descriptor.get("owns", ""),
+                "change_here_when": descriptor.get("change_here_when", ""),
+                "do_not_put_here": descriptor.get("do_not_put_here", ""),
+                "source_guide_path": descriptor.get("module_guide"),
+            }
+        )
+    return converted
+
+
+def tree_guide_signature_block_span(text: str) -> tuple[int, int, str] | None:
+    start_count = text.count(TREE_GUIDE_START_MARKER)
+    end_count = text.count(TREE_GUIDE_END_MARKER)
+    if start_count == 0 and end_count == 0:
+        return None
+    if start_count != 1 or end_count != 1:
+        raise GuidanceMapError("Malformed tree guide metadata markers: expected exactly one start and one end marker.")
+    start = text.index(TREE_GUIDE_START_MARKER)
+    end_marker_start = text.index(TREE_GUIDE_END_MARKER)
+    if end_marker_start < start:
+        raise GuidanceMapError("Malformed tree guide metadata markers: end marker appears before start marker.")
+    end = end_marker_start + len(TREE_GUIDE_END_MARKER)
+    return start, end, text[start:end]
+
+
+def tree_guide_body_from_text(text: str) -> str:
+    found = tree_guide_signature_block_span(text)
+    if found is None:
+        return module_body_from_text(text)
+    start, end, _ = found
+    return f"{text[:start].rstrip()}\n\n{text[end:].lstrip()}".strip()
+
+
+def render_tree_guide_metadata(descriptor: dict[str, Any]) -> str:
+    lines = [
+        TREE_GUIDE_START_MARKER,
+        f"Guide ID: {descriptor['id']}",
+        f"Guide kind: {descriptor.get('kind') or 'leaf'}",
+        f"Guide path: {descriptor['path']}",
+    ]
+    if descriptor.get("parent_id"):
+        lines.append(f"Parent guide ID: {descriptor['parent_id']}")
+    lines.append(TREE_GUIDE_END_MARKER)
+    return "\n".join(lines)
+
+
+def render_tree_guide_text(descriptor: dict[str, Any], body: str) -> str:
+    body = body.strip()
+    if not body:
+        raise GuidanceMapError(f"Guide '{descriptor['title']}' is empty.")
+    return f"{render_tree_guide_metadata(descriptor)}\n\n{body}\n"
+
+
+def guide_source_snapshot(root: Path, source_globs: list[str]) -> str:
+    patterns = source_globs or []
+    files = repo_files_for_scan(root, repo_root(root)[1])
+    tracked = [
+        relpath
+        for relpath in files
+        if is_source_snapshot_path(relpath) and (not patterns or matches_any(relpath, patterns))
+    ]
+    digest = hashlib.sha256()
+    for relpath in sorted(tracked):
+        digest.update(relpath.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(file_content_state(root, relpath).encode("utf-8"))
+        digest.update(b"\0")
+    return f"sha256:{digest.hexdigest()}; files={len(tracked)}"
+
+
+def guide_file_entry(root: Path, descriptor: dict[str, Any]) -> dict[str, Any]:
+    guide_path = resolve_tree_guide_path(root, descriptor["path"], f"Guide '{descriptor['title']}' path")
+    text = read_text(guide_path)
+    return {
+        "id": descriptor["id"],
+        "title": descriptor["title"],
+        "parent_id": descriptor.get("parent_id"),
+        "path": repo_relative(root, guide_path),
+        "kind": descriptor.get("kind") or "leaf",
+        "module_path": descriptor.get("module_path") or "",
+        "source_globs": unique_ordered(descriptor.get("source_globs") or []),
+        "tags": unique_ordered(descriptor.get("tags") or []),
+        "read_when": descriptor.get("read_when") or "",
+        "skip_when": descriptor.get("skip_when") or "",
+        "owns": descriptor.get("owns") or "",
+        "change_here_when": descriptor.get("change_here_when") or "",
+        "do_not_put_here": descriptor.get("do_not_put_here") or "",
+        "content_digest": guide_content_digest(text),
+        "source_snapshot": guide_source_snapshot(root, unique_ordered(descriptor.get("source_globs") or [])),
+        "size_bytes": len(text.encode("utf-8")),
+        "estimated_tokens": estimate_text_tokens(text),
+    }
+
+
+def manifest_signature_payload(manifest: dict[str, Any]) -> str:
+    unsigned = {key: value for key, value in manifest.items() if key != "signature"}
+    return canonical_json(unsigned)
+
+
+def compute_manifest_signature(
+    secret: bytes,
+    manifest: dict[str, Any],
+    timestamp: str,
+    baseline: str,
+    key_id: str,
+    local_change_baseline_value: str | None,
+) -> str:
+    return compute_signature(
+        secret,
+        "guide-manifest",
+        GENERATOR,
+        GENERATOR_VERSION,
+        GUIDE_FORMAT,
+        timestamp,
+        baseline,
+        SIGNATURE_ALGORITHM,
+        key_id,
+        manifest_signature_payload(manifest),
+        local_change_baseline_value,
+    )
+
+
+def manifest_digest_for_payload(manifest: dict[str, Any]) -> tuple[str, str]:
+    text = pretty_json(manifest)
+    return manifest_file_digest_from_text(text), text
+
+
+def write_tree_guides_and_manifest(
+    root: Path,
+    guidance: str,
+    timestamp: str,
+    baseline: str,
+    local_baseline: str,
+    key_id: str,
+    secret: bytes,
+) -> tuple[str, str, list[dict[str, Any]]]:
+    descriptors = guide_index_descriptors(root, guidance)
+    if not descriptors:
+        raise GuidanceMapError("Guide Index or Module Index must define at least one guide.")
+    for descriptor in descriptors:
+        target_path = resolve_tree_guide_path(root, descriptor["path"], f"Guide '{descriptor['title']}' path")
+        source_path_value = descriptor.get("source_guide_path")
+        if target_path.exists():
+            body = tree_guide_body_from_text(read_text(target_path))
+        elif source_path_value:
+            source_path = resolve_repo_relative_path(root, str(source_path_value), f"Guide '{descriptor['title']}' source guide")
+            if not source_path.exists():
+                raise GuidanceMapError(f"Source guide does not exist for '{descriptor['title']}': {source_path_value}")
+            body = tree_guide_body_from_text(read_text(source_path))
+        else:
+            raise GuidanceMapError(f"Guide file does not exist for '{descriptor['title']}': {descriptor['path']}")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        write_text(target_path, render_tree_guide_text(descriptor, body))
+
+    guide_entries = [guide_file_entry(root, descriptor) for descriptor in descriptors]
+    manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "generator": GENERATOR,
+        "generator_version": GENERATOR_VERSION,
+        "guide_format": GUIDE_FORMAT,
+        "generated_at": timestamp,
+        "git_baseline": baseline,
+        "local_change_baseline": local_baseline,
+        "signature_algorithm": SIGNATURE_ALGORITHM,
+        "signature_key_id": key_id,
+        "guides": guide_entries,
+    }
+    manifest["signature"] = compute_manifest_signature(secret, manifest, timestamp, baseline, key_id, local_baseline)
+    digest, text = manifest_digest_for_payload(manifest)
+    write_text(manifest_path(root), text)
+    return MANIFEST_RELATIVE_PATH, digest, guide_entries
+
+
+def manifest_metadata_from_guidance(guidance: str | None) -> tuple[str | None, str | None]:
+    if not guidance:
+        return None, None
+    manifest_rel = strip_inline_code(metadata_value(MANIFEST_PATH_RE, guidance) or "")
+    manifest_digest = strip_inline_code(metadata_value(MANIFEST_DIGEST_RE, guidance) or "")
+    return manifest_rel or None, manifest_digest or None
+
+
+def read_manifest_payload(root: Path, manifest_rel: str | None) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    if not manifest_rel:
+        return None, None, None
+    try:
+        path = resolve_repo_relative_path(root, manifest_rel, "Guidance manifest")
+    except GuidanceMapError:
+        return None, None, None
+    if repo_relative(root, path) != MANIFEST_RELATIVE_PATH:
+        return None, None, None
+    try:
+        text = read_text(path)
+        loaded = json.loads(text)
+    except (OSError, json.JSONDecodeError):
+        return None, str(path), None
+    if not isinstance(loaded, dict):
+        return None, str(path), None
+    return loaded, str(path), manifest_file_digest_from_text(text)
+
+
+def manifest_signature_is_valid(
+    manifest: dict[str, Any] | None,
+    timestamp: str | None,
+    baseline: str | None,
+    key_id: str | None,
+    local_change_baseline_value: str | None,
+    secret: bytes | None,
+) -> bool:
+    if (
+        manifest is None
+        or not timestamp
+        or baseline is None
+        or not key_id
+        or secret is None
+        or manifest.get("signature_algorithm") != SIGNATURE_ALGORITHM
+        or not isinstance(manifest.get("signature"), str)
+        or not str(manifest.get("signature")).startswith("hmac-sha256:")
+    ):
+        return False
+    expected = compute_manifest_signature(secret, manifest, timestamp, baseline, key_id, local_change_baseline_value)
+    return hmac.compare_digest(str(manifest.get("signature")), expected)
+
+
+def validate_manifest_shape(manifest: dict[str, Any] | None) -> bool:
+    if not manifest or manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+        return False
+    guides = manifest.get("guides")
+    if not isinstance(guides, list) or not guides:
+        return False
+    seen_ids: set[str] = set()
+    seen_paths: set[str] = set()
+    for entry in guides:
+        if not isinstance(entry, dict):
+            return False
+        guide_id = entry.get("id")
+        guide_path = entry.get("path")
+        if not isinstance(guide_id, str) or not guide_id.strip():
+            return False
+        if not isinstance(guide_path, str) or not guide_path.strip():
+            return False
+        if guide_id in seen_ids or guide_path in seen_paths:
+            return False
+        seen_ids.add(guide_id)
+        seen_paths.add(guide_path)
+        if not isinstance(entry.get("content_digest"), str) or not str(entry.get("content_digest")).startswith("sha256:"):
+            return False
+        if not isinstance(entry.get("source_snapshot"), str) or not str(entry.get("source_snapshot")).startswith("sha256:"):
+            return False
+    return True
+
+
+def guide_entry_path_is_safe(root: Path, entry: dict[str, Any]) -> bool:
+    try:
+        resolve_tree_guide_path(root, str(entry.get("path") or ""), f"Guide '{entry.get('id')}' path")
+    except GuidanceMapError:
+        return False
+    return True
+
+
+def guide_entry_content_status(root: Path, entry: dict[str, Any], check_source_snapshot: bool = False) -> dict[str, Any]:
+    guide_path_raw = str(entry.get("path") or "")
+    result: dict[str, Any] = {
+        "id": entry.get("id"),
+        "title": entry.get("title"),
+        "path": guide_path_raw,
+        "kind": entry.get("kind") or "leaf",
+        "exists": False,
+        "path_safe": False,
+        "content_digest": None,
+        "expected_content_digest": entry.get("content_digest"),
+        "content_valid": False,
+        "source_snapshot": None,
+        "expected_source_snapshot": entry.get("source_snapshot"),
+        "source_snapshot_valid": None,
+    }
+    try:
+        guide_path = resolve_tree_guide_path(root, guide_path_raw, f"Guide '{entry.get('id')}' path")
+    except GuidanceMapError:
+        return result
+    result["path_safe"] = True
+    result["exists"] = guide_path.exists()
+    if not guide_path.exists():
+        return result
+    text = read_text(guide_path)
+    digest = guide_content_digest(text)
+    result["content_digest"] = digest
+    result["content_valid"] = digest == entry.get("content_digest")
+    if check_source_snapshot:
+        source_snapshot = guide_source_snapshot(root, unique_ordered(entry.get("source_globs") or []))
+        result["source_snapshot"] = source_snapshot
+        result["source_snapshot_valid"] = source_snapshot == entry.get("source_snapshot")
+    return result
+
+
+def manifest_status(
+    root: Path,
+    guidance: str | None,
+    timestamp: str | None,
+    baseline: str | None,
+    key_id: str | None,
+    local_change_baseline_value: str | None,
+    secret: bytes | None,
+    changed: list[str] | None = None,
+    full: bool = False,
+) -> dict[str, Any]:
+    manifest_rel, indexed_digest = manifest_metadata_from_guidance(guidance)
+    manifest, manifest_abs, actual_digest = read_manifest_payload(root, manifest_rel)
+    digest_matches = bool(indexed_digest and actual_digest and indexed_digest == actual_digest)
+    shape_valid = validate_manifest_shape(manifest)
+    signature_valid = manifest_signature_is_valid(manifest, timestamp, baseline, key_id, local_change_baseline_value, secret)
+    changed_set = set(changed or [])
+    guide_entries = manifest.get("guides") if isinstance(manifest, dict) and isinstance(manifest.get("guides"), list) else []
+    changed_guide_entries = [
+        entry
+        for entry in guide_entries
+        if isinstance(entry, dict) and str(entry.get("path") or "") in changed_set
+    ]
+    checked_entries = guide_entries if full else changed_guide_entries
+    guide_statuses = [
+        guide_entry_content_status(root, entry, check_source_snapshot=full)
+        for entry in checked_entries
+        if isinstance(entry, dict)
+    ]
+    tampered = [
+        status
+        for status in guide_statuses
+        if not status.get("path_safe") or not status.get("exists") or not status.get("content_valid")
+    ]
+    stale = [
+        status
+        for status in guide_statuses
+        if status.get("source_snapshot_valid") is False
+    ]
+    unsafe_manifest_paths = [
+        str(entry.get("path") or "")
+        for entry in guide_entries
+        if isinstance(entry, dict) and not guide_entry_path_is_safe(root, entry)
+    ]
+    return {
+        "manifest_path": manifest_rel,
+        "manifest_abs_path": manifest_abs,
+        "manifest_exists": manifest is not None,
+        "manifest_digest": indexed_digest,
+        "manifest_actual_digest": actual_digest,
+        "manifest_digest_matches_agents": digest_matches,
+        "manifest_shape_valid": shape_valid,
+        "manifest_signature_valid": signature_valid,
+        "manifest_valid": bool(manifest and digest_matches and shape_valid and signature_valid and not unsafe_manifest_paths),
+        "manifest_guide_count": len(guide_entries),
+        "tampered_guides": tampered,
+        "stale_guides": stale,
+        "unsafe_guide_paths": unsafe_manifest_paths,
+        "checked_guide_count": len(guide_statuses),
+        "manifest": manifest if manifest and shape_valid else None,
+    }
 
 
 def module_path_values(raw: str) -> list[str]:
@@ -1578,6 +2825,49 @@ def changed_files_by_module(
     return affected, unmapped
 
 
+def changed_files_by_guides(
+    manifest: dict[str, Any] | None,
+    changed: list[str],
+    impact: dict[str, list[str]],
+) -> tuple[list[dict[str, object]], list[str]]:
+    guides = manifest.get("guides") if isinstance(manifest, dict) and isinstance(manifest.get("guides"), list) else []
+    docs_only = set(impact.get("docs_only", []))
+    considered = [file for file in changed if file not in docs_only]
+    mapped: set[str] = set()
+    affected: list[dict[str, object]] = []
+    for guide in guides:
+        if not isinstance(guide, dict):
+            continue
+        source_globs = unique_ordered(guide.get("source_globs") or [])
+        guide_path = str(guide.get("path") or "")
+        files = [
+            file
+            for file in considered
+            if file == guide_path or (source_globs and matches_any(file, source_globs))
+        ]
+        if not files:
+            continue
+        mapped.update(files)
+        categories = unique_ordered(
+            category
+            for file in files
+            for category in change_categories_for_file(file, impact)
+        )
+        affected.append(
+            {
+                "id": guide.get("id"),
+                "name": guide.get("title") or guide.get("id"),
+                "guide_path": guide_path,
+                "kind": guide.get("kind") or "leaf",
+                "read_guide_when": guide.get("read_when", ""),
+                "usually_skip_when": guide.get("skip_when", ""),
+                "changed_files": files,
+                "impact_categories": categories,
+            }
+        )
+    return affected, [file for file in considered if file not in mapped]
+
+
 def module_signature_block_span(text: str) -> tuple[int, int, str] | None:
     start_count = text.count(MODULE_START_MARKER)
     end_count = text.count(MODULE_END_MARKER)
@@ -1611,6 +2901,41 @@ def validate_module_guide_shape(module_name: str, body: str) -> None:
 
 
 def compute_module_signature(
+    secret: bytes,
+    module_name: str,
+    module_path: str,
+    module_guide: str,
+    timestamp: str,
+    baseline: str,
+    key_id: str,
+    body: str,
+    generator_version: str = GENERATOR_VERSION,
+    source_snapshot: str | None = None,
+) -> str:
+    payload_lines = [
+        f"module_name={module_name}",
+        f"module_path={module_path}",
+        f"module_guide={module_guide}",
+    ]
+    if source_snapshot is not None:
+        payload_lines.append(f"module_source_snapshot={source_snapshot}")
+    payload_lines.append(f"module_body={body.strip()}")
+    guidance = "\n".join(payload_lines)
+    return compute_signature(
+        secret,
+        "module-guide",
+        GENERATOR,
+        generator_version,
+        GUIDE_FORMAT,
+        timestamp,
+        baseline,
+        SIGNATURE_ALGORITHM,
+        key_id,
+        guidance,
+    )
+
+
+def compute_module_signature_legacy(
     secret: bytes,
     module_name: str,
     module_path: str,
@@ -1681,6 +3006,7 @@ def sign_module_guides(
             raise GuidanceMapError(f"Module guide does not exist for '{descriptor['name']}': {descriptor['module_guide']}")
         body = module_body_from_text(read_text(guide_path))
         validate_module_guide_shape(descriptor["name"], body)
+        source_snapshot = module_source_snapshot(root, descriptor["module_path"])
         signature = compute_module_signature(
             secret,
             descriptor["name"],
@@ -1690,9 +3016,10 @@ def sign_module_guides(
             baseline,
             key_id,
             body,
+            source_snapshot=source_snapshot,
         )
         write_text(guide_path, update_module_signature_text(read_text(guide_path), signature))
-        signed.append({**descriptor, "signature": signature})
+        signed.append({**descriptor, "signature": signature, "source_snapshot": source_snapshot})
     return signed
 
 
@@ -1722,6 +3049,8 @@ def module_signature_is_valid(
     if not signature or not signature.startswith("hmac-sha256:"):
         return False, signature
     body = module_body_from_text(text)
+    indexed_snapshot = descriptor.get("source_snapshot") or ""
+    source_snapshot = module_source_snapshot(root, descriptor["module_path"])
     expected = compute_module_signature(
         secret,
         descriptor["name"],
@@ -1732,8 +3061,24 @@ def module_signature_is_valid(
         key_id,
         body,
         generator_version,
+        source_snapshot=source_snapshot,
     )
-    return hmac.compare_digest(signature, expected), signature
+    if hmac.compare_digest(signature, expected):
+        return True, signature
+    if not indexed_snapshot:
+        legacy_expected = compute_module_signature_legacy(
+            secret,
+            descriptor["name"],
+            descriptor["module_path"],
+            descriptor["module_guide"],
+            timestamp,
+            baseline,
+            key_id,
+            body,
+            generator_version,
+        )
+        return hmac.compare_digest(signature, legacy_expected), signature
+    return False, signature
 
 
 def module_statuses(
@@ -1767,6 +3112,8 @@ def module_statuses(
                 "module_signature": file_signature,
                 "module_signature_matches_index": bool(index_signature and file_signature and index_signature == file_signature),
                 "module_signature_valid": signature_valid,
+                "module_source_snapshot": module_source_snapshot(root, descriptor["module_path"]),
+                "index_module_source_snapshot": descriptor.get("source_snapshot") or None,
                 "read_guide_when": descriptor.get("read_guide_when", ""),
                 "usually_skip_when": descriptor.get("usually_skip_when", ""),
             }
@@ -1788,6 +3135,28 @@ def update_signature_field(module_body: str, signature: str) -> str:
     return "\n".join(lines).strip()
 
 
+def update_source_snapshot_field(module_body: str, source_snapshot: str) -> str:
+    replacement = f"- Module Source Snapshot: `{source_snapshot}`"
+    if field_value(module_body, "Module Source Snapshot") is not None:
+        return re.sub(r"^- Module Source Snapshot:\s*.*$", replacement, module_body, count=1, flags=re.MULTILINE)
+
+    lines = module_body.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("- Module Signature:"):
+            lines.insert(index + 1, replacement)
+            return "\n".join(lines).strip()
+    for index, line in enumerate(lines):
+        if line.startswith("- Module Guide:"):
+            lines.insert(index + 1, replacement)
+            return "\n".join(lines).strip()
+    lines.insert(0, replacement)
+    return "\n".join(lines).strip()
+
+
+def update_module_index_metadata(module_body: str, signature: str, source_snapshot: str) -> str:
+    return update_source_snapshot_field(update_signature_field(module_body, signature), source_snapshot)
+
+
 def update_module_index_signatures(guidance: str, signed_modules: list[dict[str, str]]) -> str:
     span = section_span(guidance, "Module Index")
     if span is None:
@@ -1796,6 +3165,7 @@ def update_module_index_signatures(guidance: str, signed_modules: list[dict[str,
     module_index_body = guidance[body_start:body_end].strip()
     matches = list(MODULE_HEADING_RE.finditer(module_index_body))
     signatures = {module["name"]: module["signature"] for module in signed_modules}
+    source_snapshots = {module["name"]: module.get("source_snapshot", "") for module in signed_modules}
     pieces: list[str] = []
     cursor = 0
     for index, match in enumerate(matches):
@@ -1805,7 +3175,11 @@ def update_module_index_signatures(guidance: str, signed_modules: list[dict[str,
         pieces.append(module_index_body[cursor:entry_body_start])
         entry_body = module_index_body[entry_body_start:entry_end].strip()
         if module_name in signatures:
-            pieces.append("\n\n" + update_signature_field(entry_body, signatures[module_name]) + "\n")
+            pieces.append(
+                "\n\n"
+                + update_module_index_metadata(entry_body, signatures[module_name], source_snapshots.get(module_name, ""))
+                + "\n"
+            )
         else:
             pieces.append(module_index_body[entry_body_start:entry_end])
         cursor = entry_end
@@ -1819,7 +3193,8 @@ def validate_guidance_shape(guidance: str) -> None:
     if not stripped:
         raise GuidanceMapError("Guidance content is empty.")
     section_positions: list[int] = []
-    for section in REQUIRED_GUIDE_SECTIONS:
+    common_sections = ("Agent Editing Rules", "Task Routing", "Module Dependency Rules")
+    for section in common_sections:
         match = re.search(rf"^### {re.escape(section)}\s*$", stripped, re.MULTILINE)
         if match is None:
             raise GuidanceMapError(f"Guidance content is missing required section: {section}.")
@@ -1827,7 +3202,7 @@ def validate_guidance_shape(guidance: str) -> None:
     if section_positions != sorted(section_positions):
         raise GuidanceMapError(
             "Guidance sections must be ordered as: "
-            + ", ".join(REQUIRED_GUIDE_SECTIONS)
+            + ", ".join(common_sections)
             + "."
         )
 
@@ -1843,10 +3218,27 @@ def validate_guidance_shape(guidance: str) -> None:
     if not re.search(r"^- \S", dependency_rules, re.MULTILINE):
         raise GuidanceMapError("Module Dependency Rules must contain at least one bullet.")
 
+    guide_index = top_level_section_body(stripped, "Guide Index")
+    guidance_manifest = top_level_section_body(stripped, "Guidance Manifest")
     module_index = top_level_section_body(stripped, "Module Index") or ""
+    if guide_index is not None:
+        guides = module_entries(guide_index)
+        if not guides:
+            raise GuidanceMapError("Guide Index must contain at least one '#### <guide name>' entry.")
+        for guide_name, guide_body in guides:
+            if not guide_name:
+                raise GuidanceMapError("Guide Index contains an empty guide heading.")
+            if field_value(guide_body, "Guide ID") is None and not guide_id_slug(guide_name):
+                raise GuidanceMapError(f"Guide '{guide_name}' is missing required field: Guide ID.")
+        return
+    if guidance_manifest is not None:
+        manifest_rel, manifest_digest = manifest_metadata_from_guidance(stripped)
+        if not manifest_rel or not manifest_digest:
+            raise GuidanceMapError("Guidance Manifest must include Guidance manifest and Guidance manifest digest lines.")
+        return
     modules = module_entries(module_index)
     if not modules:
-        raise GuidanceMapError("Module Index must contain at least one '#### <module name>' entry.")
+        raise GuidanceMapError("Guidance content must contain Guide Index, Guidance Manifest, or Module Index.")
     for module_name, module_body in modules:
         if not module_name:
             raise GuidanceMapError("Module Index contains an empty module heading.")
@@ -1908,6 +3300,21 @@ def render_block(
     )
 
 
+def guidance_body_with_manifest(guidance: str, manifest_rel: str, manifest_digest: str) -> str:
+    body = remove_top_level_section(guidance, "Guide Index")
+    body = remove_top_level_section(body, "Module Index")
+    body = remove_top_level_section(body, "Guidance Manifest")
+    manifest_section = "\n".join(
+        [
+            "### Guidance Manifest",
+            "",
+            f"Guidance manifest: `{manifest_rel}`",
+            f"Guidance manifest digest: `{manifest_digest}`",
+        ]
+    )
+    return f"{body.strip()}\n\n{manifest_section}".strip()
+
+
 def update_agents_text(existing: str, block: str) -> str:
     found = find_block(existing)
     if found is None:
@@ -1927,7 +3334,7 @@ def update_agents_text(existing: str, block: str) -> str:
     return "\n\n".join(pieces) + "\n"
 
 
-def status(repo_arg: Path) -> dict[str, object]:
+def status(repo_arg: Path, full: bool = False) -> dict[str, object]:
     root, git_available = repo_root(repo_arg)
     agents_path = root / "AGENTS.md"
     exists = agents_path.exists()
@@ -1954,7 +3361,8 @@ def status(repo_arg: Path) -> dict[str, object]:
         "patch-compatible",
     }
     generator_version_requires_full_read = has_block and version_status in {"missing", "invalid", "incompatible"}
-    guide_format_valid = (not has_block and guide_format is None) or guide_format == GUIDE_FORMAT
+    guide_format_valid = (not has_block and guide_format is None) or guide_format in SUPPORTED_GUIDE_FORMATS
+    guide_format_current = (not has_block and guide_format is None) or guide_format == GUIDE_FORMAT
     signature_secret, signature_key_available, signature_key_source = load_signature_secret(signature_key_id, create=False)
     signature_valid = (
         signature_is_valid(
@@ -1974,20 +3382,62 @@ def status(repo_arg: Path) -> dict[str, object]:
         else None
     )
     guidance_body = guidance_body_from_block(block) if block else None
-    module_results = module_statuses(
-        root,
-        guidance_body,
-        generator_version,
-        generated_at,
-        git_baseline,
-        signature_key_id,
-        signature_secret,
+    changes = changed_files(root, git_available, parsed_generated_at, local_change_baseline_entries)
+    is_v4 = guide_format == GUIDE_FORMAT
+    module_results = (
+        []
+        if is_v4
+        else module_statuses(
+            root,
+            guidance_body,
+            generator_version,
+            generated_at,
+            git_baseline,
+            signature_key_id,
+            signature_secret,
+        )
     )
-    modules_valid = bool(module_results) and all(
-        bool(module["module_guide_exists"])
-        and bool(module["module_signature_valid"])
-        and bool(module["module_signature_matches_index"])
-        for module in module_results
+    modules_valid = (
+        None
+        if is_v4
+        else bool(module_results)
+        and all(
+            bool(module["module_guide_exists"])
+            and bool(module["module_signature_valid"])
+            and bool(module["module_signature_matches_index"])
+            for module in module_results
+        )
+    )
+    manifest_result = (
+        manifest_status(
+            root,
+            guidance_body,
+            generated_at,
+            git_baseline,
+            signature_key_id,
+            local_change_baseline_value,
+            signature_secret,
+            changed=changes["all"],
+            full=full,
+        )
+        if is_v4
+        else {
+            "manifest_path": None,
+            "manifest_abs_path": None,
+            "manifest_exists": False,
+            "manifest_digest": None,
+            "manifest_actual_digest": None,
+            "manifest_digest_matches_agents": None,
+            "manifest_shape_valid": None,
+            "manifest_signature_valid": None,
+            "manifest_valid": None,
+            "manifest_guide_count": 0,
+            "tampered_guides": [],
+            "stale_guides": [],
+            "unsafe_guide_paths": [],
+            "checked_guide_count": 0,
+            "manifest": None,
+        }
     )
     requires_full_read = (not has_block) or (
         has_block
@@ -1995,12 +3445,18 @@ def status(repo_arg: Path) -> dict[str, object]:
             not generator_version_valid
             or generator_version_requires_full_read
             or not guide_format_valid
+            or not guide_format_current
             or not generated_at_valid
             or not local_change_baseline_valid
             or not signature_valid
+            or (is_v4 and not manifest_result.get("manifest_valid"))
         )
     )
-    changes = changed_files(root, git_available, parsed_generated_at, local_change_baseline_entries)
+    requires_module_refresh = (
+        bool(has_block and not requires_full_read and not modules_valid)
+        if not is_v4
+        else bool(manifest_result.get("tampered_guides") or manifest_result.get("stale_guides"))
+    )
 
     return {
         "repo_root": str(root),
@@ -2016,6 +3472,7 @@ def status(repo_arg: Path) -> dict[str, object]:
         "generated_by": legacy_generated_by,
         "guide_format": guide_format,
         "guide_format_valid": guide_format_valid,
+        "guide_format_current": guide_format_current,
         "generated_at": generated_at,
         "generated_at_valid": generated_at_valid,
         "git_baseline": git_baseline,
@@ -2027,9 +3484,23 @@ def status(repo_arg: Path) -> dict[str, object]:
         "signature_algorithm": signature_algorithm,
         "signature": signature,
         "signature_valid": signature_valid,
+        "manifest_path": manifest_result.get("manifest_path"),
+        "manifest_abs_path": manifest_result.get("manifest_abs_path"),
+        "manifest_exists": manifest_result.get("manifest_exists"),
+        "manifest_digest": manifest_result.get("manifest_digest"),
+        "manifest_actual_digest": manifest_result.get("manifest_actual_digest"),
+        "manifest_digest_matches_agents": manifest_result.get("manifest_digest_matches_agents"),
+        "manifest_shape_valid": manifest_result.get("manifest_shape_valid"),
+        "manifest_signature_valid": manifest_result.get("manifest_signature_valid"),
+        "manifest_valid": manifest_result.get("manifest_valid"),
+        "manifest_guide_count": manifest_result.get("manifest_guide_count"),
+        "tampered_guides": manifest_result.get("tampered_guides"),
+        "stale_guides": manifest_result.get("stale_guides"),
+        "unsafe_guide_paths": manifest_result.get("unsafe_guide_paths"),
+        "checked_guide_count": manifest_result.get("checked_guide_count"),
         "modules": module_results,
         "modules_valid": modules_valid if has_block else None,
-        "requires_module_refresh": bool(has_block and not requires_full_read and not modules_valid),
+        "requires_module_refresh": requires_module_refresh,
         "git_available": git_available,
         "current_head": current_head(root, git_available),
         "changed_files": changes["all"],
@@ -2038,21 +3509,38 @@ def status(repo_arg: Path) -> dict[str, object]:
     }
 
 
-def verify(repo_arg: Path) -> dict[str, object]:
-    current = status(repo_arg)
+def verify(repo_arg: Path, full: bool = False) -> dict[str, object]:
+    current = status(repo_arg, full=full)
     changed = current["changed_files"]
     impact = classify_changed_files(changed if isinstance(changed, list) else [])
-    modules = current["modules"] if isinstance(current.get("modules"), list) else []
-    affected_modules, unmapped_changed_files = changed_files_by_module(
-        modules if isinstance(modules, list) else [],
-        changed if isinstance(changed, list) else [],
-        impact,
-    )
-    affected_module_guides = unique_ordered(
-        str(module.get("module_guide") or "")
-        for module in affected_modules
-        if module.get("module_guide")
-    )
+    is_v4 = current.get("guide_format") == GUIDE_FORMAT
+    if is_v4:
+        manifest_payload, _, _ = read_manifest_payload(
+            Path(str(current["repo_root"])),
+            str(current.get("manifest_path") or "") or None,
+        )
+        affected_modules, unmapped_changed_files = changed_files_by_guides(
+            manifest_payload if isinstance(manifest_payload, dict) else None,
+            changed if isinstance(changed, list) else [],
+            impact,
+        )
+        affected_module_guides = unique_ordered(
+            str(guide.get("guide_path") or "")
+            for guide in affected_modules
+            if guide.get("guide_path")
+        )
+    else:
+        modules = current["modules"] if isinstance(current.get("modules"), list) else []
+        affected_modules, unmapped_changed_files = changed_files_by_module(
+            modules if isinstance(modules, list) else [],
+            changed if isinstance(changed, list) else [],
+            impact,
+        )
+        affected_module_guides = unique_ordered(
+            str(module.get("module_guide") or "")
+            for module in affected_modules
+            if module.get("module_guide")
+        )
     reasons: list[str] = []
     recommended_action = "none"
     severity = "ok"
@@ -2070,16 +3558,16 @@ def verify(repo_arg: Path) -> dict[str, object]:
             reasons.append("Generated at timestamp is missing or invalid.")
         if current["has_block"] and not current["guide_format_valid"]:
             reasons.append("Guide format is missing or unsupported.")
+        if current["has_block"] and current["guide_format_valid"] and not current.get("guide_format_current"):
+            reasons.append("Guide format is legacy; refresh to generate the v4 manifest-backed guide tree.")
         if current["has_block"] and not current["local_change_baseline_valid"]:
             reasons.append("Local change baseline is malformed; refresh the guidance map with the current plugin.")
         if current["has_block"] and not current["signature_key_available"]:
             reasons.append("Signature key is unavailable; this block must be refreshed by the plugin or verified with the configured key.")
         if current["has_block"] and not current["signature_valid"]:
             reasons.append("Signature metadata is missing or invalid.")
-    elif current.get("requires_module_refresh"):
-        recommended_action = "refresh_affected_modules"
-        severity = "warning"
-        reasons.append("One or more module guide files are missing, unsigned, or no longer match their module signature.")
+        if is_v4 and not current.get("manifest_valid"):
+            reasons.append("Guidance manifest is missing, unsigned, mismatched with AGENTS.md, malformed, or contains unsafe guide paths.")
     else:
         if current["generator_version_status"] == "patch-compatible":
             severity = "info"
@@ -2105,6 +3593,13 @@ def verify(repo_arg: Path) -> dict[str, object]:
         elif impact["docs_only"]:
             severity = "info"
             reasons.append("Only documentation or CI files changed; guidance refresh is not required.")
+        if current.get("requires_module_refresh") and recommended_action in {"none", "review_changed_files"}:
+            recommended_action = "refresh_affected_modules"
+            severity = "warning"
+            if is_v4:
+                reasons.append("One or more manifest-backed guides are tampered, missing, or no longer match their source snapshot.")
+            else:
+                reasons.append("One or more module guide files are missing, unsigned, or no longer match their module source snapshot or signature.")
 
     if current["has_block"] and unmapped_changed_files:
         code_unmapped = [
@@ -2121,12 +3616,633 @@ def verify(repo_arg: Path) -> dict[str, object]:
         **current,
         "change_impact": impact,
         "affected_modules": affected_modules,
+        "affected_guides": affected_modules if is_v4 else [],
         "affected_module_guides": affected_module_guides,
         "unmapped_changed_files": unmapped_changed_files,
         "stale": recommended_action not in {"none", "review_changed_files"},
         "severity": severity,
         "recommended_action": recommended_action,
         "reasons": reasons,
+    }
+
+
+def query_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[A-Za-z0-9_./-]+", text.casefold())
+        if len(token) >= 2 and token not in {"the", "and", "for", "with", "this", "that", "when", "only"}
+    }
+
+
+def guidance_body_for_repo(root: Path) -> str:
+    agents_path = root / "AGENTS.md"
+    if not agents_path.exists():
+        raise GuidanceMapError("AGENTS.md does not exist; run build before query.")
+    found = find_block(read_text(agents_path))
+    if found is None:
+        raise GuidanceMapError("AGENTS.md guidance block is missing; run build before query.")
+    body = guidance_body_from_block(found[2])
+    if body is None:
+        raise GuidanceMapError("AGENTS.md guidance body is unavailable; run build before query.")
+    return body
+
+
+def section_bullets(guidance: str, section: str) -> list[str]:
+    body = top_level_section_body(guidance, section) or ""
+    return [line[2:].strip() for line in body.splitlines() if line.startswith("- ")]
+
+
+def score_text(tokens: set[str], text: str) -> int:
+    haystack = text.casefold()
+    return sum(1 for token in tokens if token in haystack)
+
+
+def likely_test_paths(root: Path, module_paths: list[str]) -> list[str]:
+    candidates: list[str] = []
+    for module_path in module_paths:
+        normalized = module_path.strip().replace("\\", "/").rstrip("/") or "."
+        if normalized == ".":
+            candidates.extend(["tests", "test", "src/test"])
+            continue
+        candidates.extend([f"{normalized}/tests", f"{normalized}/test", f"{normalized}/__tests__"])
+        if "/src/main/" in f"/{normalized}/":
+            candidates.append(normalized.replace("/src/main/", "/src/test/"))
+        if normalized.startswith("src/main/"):
+            candidates.append(normalized.replace("src/main/", "src/test/", 1))
+        basename = normalized.split("/")[-1]
+        candidates.extend([f"tests/{basename}", f"test/{basename}"])
+    return [path for path in unique_ordered(candidates) if (root / path).exists()]
+
+
+def graphify_query_command(root: Path, query_text: str, budget: int, graphify_command: str | None = None) -> list[str]:
+    return [
+        *split_tool_command(graphify_command, ["uvx", "--from", "graphifyy", "graphify"]),
+        "query",
+        query_text,
+        "--budget",
+        str(budget),
+        "--graph",
+        str(graphify_graph_path(root)),
+    ]
+
+
+def run_graphify_query(
+    root: Path,
+    query_text: str,
+    budget: int = 1200,
+    graphify_command: str | None = None,
+    timeout_seconds: float = GRAPHIFY_QUERY_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    graph_path = graphify_graph_path(root)
+    if not graph_path.exists():
+        return {
+            "status": "unavailable",
+            "message": "graphify-out/graph.json was not found.",
+            "graph_path": str(graph_path),
+        }
+    cmd = graphify_query_command(root, query_text, budget, graphify_command)
+    started = time.perf_counter()
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "status": "timeout",
+            "command": cmd,
+            "duration_seconds": round(time.perf_counter() - started, 3),
+            "timeout_seconds": timeout_seconds,
+            "stdout": (exc.stdout or "")[-GRAPHIFY_OUTPUT_MAX_CHARS:] if isinstance(exc.stdout, str) else "",
+            "stderr": (exc.stderr or "")[-GRAPHIFY_OUTPUT_MAX_CHARS:] if isinstance(exc.stderr, str) else "",
+        }
+    except OSError as exc:
+        return {
+            "status": "error",
+            "command": cmd,
+            "duration_seconds": round(time.perf_counter() - started, 3),
+            "message": str(exc),
+        }
+    stdout = result.stdout[-GRAPHIFY_OUTPUT_MAX_CHARS:]
+    stderr = result.stderr[-GRAPHIFY_OUTPUT_MAX_CHARS:]
+    return {
+        "status": "ok" if result.returncode == 0 else "failed",
+        "command": cmd,
+        "returncode": result.returncode,
+        "duration_seconds": round(time.perf_counter() - started, 3),
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_estimated_tokens": estimate_text_tokens(stdout),
+    }
+
+
+def source_globs_to_candidate_paths(source_globs: list[str]) -> list[str]:
+    paths: list[str] = []
+    for pattern in source_globs:
+        value = pattern.strip().replace("\\", "/")
+        if not value:
+            continue
+        for marker in ("/**", "/*"):
+            if marker in value:
+                value = value.split(marker, 1)[0]
+                break
+        value = value.rstrip("/")
+        if value and value not in {"**", "*"}:
+            paths.append(value)
+    return unique_ordered(paths)
+
+
+def guidance_tree_query(
+    root: Path,
+    query_text: str,
+    guidance: str,
+    verification: dict[str, object],
+    manifest: dict[str, Any],
+    use_graphify: bool,
+    budget: int,
+    run_graphify: bool,
+    graphify_command: str | None,
+) -> dict[str, Any]:
+    if not verification.get("signature_valid") or not verification.get("manifest_valid"):
+        raise GuidanceMapError("Guidance manifest or AGENTS.md signature is invalid; refresh before query.")
+    guides = manifest.get("guides") if isinstance(manifest.get("guides"), list) else []
+    if not guides:
+        raise GuidanceMapError("Guidance manifest has no guides; refresh before query.")
+    tokens = query_tokens(query_text)
+    affected_guides = set(verification.get("affected_module_guides") or [])
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for entry in guides:
+        if not isinstance(entry, dict):
+            continue
+        combined = " ".join(
+            [
+                str(entry.get("id") or ""),
+                str(entry.get("title") or ""),
+                str(entry.get("path") or ""),
+                " ".join(str(tag) for tag in entry.get("tags") or []),
+                " ".join(str(glob) for glob in entry.get("source_globs") or []),
+                str(entry.get("read_when") or ""),
+                str(entry.get("owns") or ""),
+                str(entry.get("change_here_when") or ""),
+                str(entry.get("do_not_put_here") or ""),
+            ]
+        )
+        score = score_text(tokens, combined)
+        skip_score = score_text(tokens, str(entry.get("skip_when") or ""))
+        score -= skip_score
+        if entry.get("path") in affected_guides:
+            score += 3
+        if entry.get("kind") == "parent" and score > 0:
+            score += 1
+        scored.append((score, entry))
+    scored.sort(key=lambda item: (-item[0], str(item[1].get("id") or "")))
+    selected = [entry for score, entry in scored if score > 0][:QUERY_MAX_GUIDES]
+    if not selected:
+        selected = [entry for _, entry in scored[:QUERY_MAX_GUIDES]]
+
+    entries_by_id = {str(entry.get("id")): entry for entry in guides if isinstance(entry, dict) and entry.get("id")}
+    with_parents: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for entry in selected:
+        parent_chain: list[dict[str, Any]] = []
+        parent_id = entry.get("parent_id")
+        while parent_id and parent_id in entries_by_id:
+            parent = entries_by_id[str(parent_id)]
+            parent_chain.append(parent)
+            parent_id = parent.get("parent_id")
+        for candidate in [*reversed(parent_chain), entry]:
+            guide_id = str(candidate.get("id") or "")
+            if guide_id and guide_id not in seen_ids and len(with_parents) < QUERY_MAX_GUIDES:
+                with_parents.append(candidate)
+                seen_ids.add(guide_id)
+
+    verified_guides: list[dict[str, Any]] = []
+    skipped_guides: list[dict[str, Any]] = []
+    for entry in with_parents:
+        status_result = guide_entry_content_status(root, entry, check_source_snapshot=False)
+        if status_result.get("path_safe") and status_result.get("exists") and status_result.get("content_valid"):
+            verified_guides.append(
+                {
+                    "id": entry.get("id"),
+                    "title": entry.get("title"),
+                    "path": entry.get("path"),
+                    "kind": entry.get("kind") or "leaf",
+                    "why": entry.get("read_when") or entry.get("change_here_when") or entry.get("owns") or "",
+                    "avoid": entry.get("do_not_put_here") or "",
+                    "estimated_tokens": entry.get("estimated_tokens"),
+                    "content_digest": entry.get("content_digest"),
+                }
+            )
+        else:
+            skipped_guides.append(
+                {
+                    "id": entry.get("id"),
+                    "title": entry.get("title"),
+                    "path": entry.get("path"),
+                    "reason": "guide digest mismatch, missing file, or unsafe path",
+                    "status": status_result,
+                }
+            )
+
+    candidate_source_paths = source_globs_to_candidate_paths(
+        [
+            str(glob)
+            for guide in verified_guides
+            for entry in guides
+            if isinstance(entry, dict) and entry.get("id") == guide.get("id")
+            for glob in (entry.get("source_globs") or [])
+        ]
+    )
+    candidate_tests = likely_test_paths(root, candidate_source_paths)
+    task_rules = [
+        bullet
+        for bullet in section_bullets(guidance, "Task Routing")
+        if score_text(tokens, bullet) > 0
+    ][:8]
+    dependency_rules = [
+        bullet
+        for bullet in section_bullets(guidance, "Module Dependency Rules")
+        if score_text(tokens, bullet) > 0
+    ][:8]
+    if not dependency_rules:
+        dependency_rules = section_bullets(guidance, "Module Dependency Rules")[:3]
+
+    project_map = deterministic_project_scan(root, verification)
+    graph_path = graphify_graph_path(root)
+    graphify_command_text = None
+    graphify_result = None
+    if graph_path.exists() and use_graphify:
+        command_list = graphify_query_command(root, query_text, budget, graphify_command)
+        graphify_command_text = " ".join(shlex.quote(part) for part in command_list)
+        if run_graphify:
+            graphify_result = run_graphify_query(root, query_text, budget, graphify_command)
+    graphify_meta = graphify_graph_metadata(root)
+    return {
+        "repo_root": str(root),
+        "query": query_text,
+        "query_mode": "manifest_tree",
+        "recommended_guide_paths": [str(guide["path"]) for guide in verified_guides],
+        "recommended_module_guides": [str(guide["path"]) for guide in verified_guides],
+        "parent_routing_guides": [guide for guide in verified_guides if guide.get("kind") == "parent"],
+        "leaf_detail_guides": [guide for guide in verified_guides if guide.get("kind") != "parent"],
+        "verified_guides": verified_guides,
+        "verified_guide_count": len(verified_guides),
+        "skipped_guides": skipped_guides,
+        "tampered_guide_warnings": skipped_guides,
+        "candidate_source_paths": candidate_source_paths,
+        "candidate_test_paths": candidate_tests,
+        "relevant_task_routing": task_rules,
+        "relevant_dependency_rules": dependency_rules,
+        "refresh_scope": {
+            "recommended_action": verification.get("recommended_action"),
+            "affected_guides": verification.get("affected_guides"),
+            "affected_module_guides": verification.get("affected_module_guides"),
+            "stale": verification.get("stale"),
+        },
+        "graphify": {
+            **graphify_meta,
+            "query_command": graphify_command_text,
+            "query_result": graphify_result,
+            "note": "Use query/path output as evidence; do not load graph.json directly into context."
+            if graph_path.exists()
+            else "graphify-out/graph.json was not found.",
+        },
+        "project_map_summary": {
+            "language_file_counts": project_map.get("language_file_counts"),
+            "module_candidate_count": len(project_map.get("module_candidates", []))
+            if isinstance(project_map.get("module_candidates"), list)
+            else 0,
+        },
+    }
+
+
+def guidance_query(
+    repo_arg: Path,
+    query_text: str,
+    use_graphify: bool = False,
+    budget: int = 1200,
+    run_graphify: bool = False,
+    graphify_command: str | None = None,
+) -> dict[str, Any]:
+    root, _ = repo_root(repo_arg)
+    verification = verify(root)
+    guidance = guidance_body_for_repo(root)
+    if verification.get("guide_format") == GUIDE_FORMAT:
+        manifest, _, _ = read_manifest_payload(root, str(verification.get("manifest_path") or "") or None)
+        if not isinstance(manifest, dict):
+            raise GuidanceMapError("Guidance manifest is unavailable; refresh before query.")
+        return guidance_tree_query(
+            root,
+            query_text,
+            guidance,
+            verification,
+            manifest,
+            use_graphify,
+            budget,
+            run_graphify,
+            graphify_command,
+        )
+    descriptors = module_index_descriptors(root, guidance)
+    tokens = query_tokens(query_text)
+    affected_guides = set(verification.get("affected_module_guides") or [])
+    scored: list[tuple[int, dict[str, str]]] = []
+    for descriptor in descriptors:
+        combined = " ".join(
+            [
+                descriptor.get("name", ""),
+                descriptor.get("module_path", ""),
+                descriptor.get("owns", ""),
+                descriptor.get("change_here_when", ""),
+                descriptor.get("do_not_put_here", ""),
+                descriptor.get("read_guide_when", ""),
+                descriptor.get("usually_skip_when", ""),
+            ]
+        )
+        score = score_text(tokens, combined)
+        if descriptor.get("module_guide") in affected_guides:
+            score += 3
+        scored.append((score, descriptor))
+    scored.sort(key=lambda item: (-item[0], item[1]["name"]))
+    selected = [descriptor for score, descriptor in scored if score > 0][:QUERY_MAX_MODULES]
+    if not selected:
+        selected = [descriptor for _, descriptor in scored[:QUERY_MAX_MODULES]]
+
+    candidate_source_paths = unique_ordered(
+        path
+        for descriptor in selected
+        for path in module_path_values(descriptor.get("module_path", ""))
+    )
+    candidate_tests = likely_test_paths(root, candidate_source_paths)
+    task_rules = [
+        bullet
+        for bullet in section_bullets(guidance, "Task Routing")
+        if score_text(tokens, bullet) > 0
+    ][:8]
+    dependency_rules = [
+        bullet
+        for bullet in section_bullets(guidance, "Module Dependency Rules")
+        if score_text(tokens, bullet) > 0
+    ][:8]
+    if not dependency_rules:
+        dependency_rules = section_bullets(guidance, "Module Dependency Rules")[:3]
+
+    project_map = deterministic_project_scan(root, verification)
+    graph_path = graphify_graph_path(root)
+    graphify_command_text = None
+    graphify_result = None
+    if graph_path.exists() and use_graphify:
+        command_list = graphify_query_command(root, query_text, budget, graphify_command)
+        graphify_command_text = " ".join(shlex.quote(part) for part in command_list)
+        if run_graphify:
+            graphify_result = run_graphify_query(root, query_text, budget, graphify_command)
+    graphify_meta = graphify_graph_metadata(root)
+    return {
+        "repo_root": str(root),
+        "query": query_text,
+        "recommended_module_guides": [descriptor["module_guide"] for descriptor in selected],
+        "modules": [
+            {
+                "name": descriptor["name"],
+                "module_path": descriptor["module_path"],
+                "module_guide": descriptor["module_guide"],
+                "why": descriptor.get("change_here_when") or descriptor.get("owns") or "",
+                "avoid": descriptor.get("do_not_put_here") or "",
+            }
+            for descriptor in selected
+        ],
+        "candidate_source_paths": candidate_source_paths,
+        "candidate_test_paths": candidate_tests,
+        "relevant_task_routing": task_rules,
+        "relevant_dependency_rules": dependency_rules,
+        "refresh_scope": {
+            "recommended_action": verification.get("recommended_action"),
+            "affected_module_guides": verification.get("affected_module_guides"),
+            "stale": verification.get("stale"),
+        },
+        "graphify": {
+            **graphify_meta,
+            "query_command": graphify_command_text,
+            "query_result": graphify_result,
+            "note": "Use query/path output as evidence; do not load graph.json directly into context."
+            if graph_path.exists()
+            else "graphify-out/graph.json was not found.",
+        },
+        "project_map_summary": {
+            "language_file_counts": project_map.get("language_file_counts"),
+            "module_candidate_count": len(project_map.get("module_candidates", []))
+            if isinstance(project_map.get("module_candidates"), list)
+            else 0,
+        },
+    }
+
+
+def file_size_or_zero(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def latest_build_metrics(state_dir: Path) -> dict[str, Any] | None:
+    log_dir = state_dir / "logs"
+    if not log_dir.exists():
+        return None
+    metrics_files = sorted(log_dir.glob("*.metrics.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for path in metrics_files:
+        payload = read_json_file(path)
+        if payload:
+            payload["metrics_file"] = str(path)
+            return payload
+    return None
+
+
+def guide_tree_metrics(root: Path) -> dict[str, Any]:
+    manifest = read_json_file(manifest_path(root))
+    guides = manifest.get("guides") if isinstance(manifest.get("guides"), list) else []
+    guide_count = len(guides)
+    parent_count = sum(1 for guide in guides if isinstance(guide, dict) and guide.get("kind") == "parent")
+    leaf_count = sum(1 for guide in guides if isinstance(guide, dict) and guide.get("kind") != "parent")
+    guide_bytes = [
+        int(guide.get("size_bytes") or 0)
+        for guide in guides
+        if isinstance(guide, dict)
+    ]
+    guide_tokens = [
+        int(guide.get("estimated_tokens") or 0)
+        for guide in guides
+        if isinstance(guide, dict)
+    ]
+    return {
+        "manifest_bytes": file_size_or_zero(manifest_path(root)),
+        "guide_count": guide_count,
+        "parent_guide_count": parent_count,
+        "leaf_guide_count": leaf_count,
+        "guide_bytes": sum(guide_bytes),
+        "average_guide_bytes": round(sum(guide_bytes) / guide_count, 1) if guide_count else 0,
+        "average_guide_estimated_tokens": round(sum(guide_tokens) / guide_count, 1) if guide_count else 0,
+    }
+
+
+def benchmark_build(
+    repo_arg: Path,
+    start_build: bool = False,
+    launcher: str | None = None,
+    codex_command: str | None = None,
+) -> dict[str, Any]:
+    root, git_available = repo_root(repo_arg)
+    started = time.perf_counter()
+    scan_started = time.perf_counter()
+    verification = verify(root)
+    project_map = write_project_map(root, verification)
+    scan_duration = round(time.perf_counter() - scan_started, 3)
+    agents_path = root / "AGENTS.md"
+    module_files = list((root / ".agents" / "guidance-map" / "modules").glob("*.md"))
+    tree_metrics = guide_tree_metrics(root)
+    state_dir = build_state_dir(root, git_available)
+    output: dict[str, Any] = {
+        "repo_root": str(root),
+        "project_id": project_id(root, git_available),
+        "status": "benchmarked",
+        "scan_duration_seconds": scan_duration,
+        "total_duration_seconds": round(time.perf_counter() - started, 3),
+        "project_map_file": str(project_map_path(root)),
+        "project_map_bytes": file_size_or_zero(project_map_path(root)),
+        "agents_bytes": file_size_or_zero(agents_path),
+        "module_guide_count": len(module_files),
+        "module_guide_bytes": sum(file_size_or_zero(path) for path in module_files),
+        "manifest_bytes": tree_metrics["manifest_bytes"],
+        "tree_guide_count": tree_metrics["guide_count"],
+        "parent_guide_count": tree_metrics["parent_guide_count"],
+        "leaf_guide_count": tree_metrics["leaf_guide_count"],
+        "tree_guide_bytes": tree_metrics["guide_bytes"],
+        "average_tree_guide_bytes": tree_metrics["average_guide_bytes"],
+        "average_tree_guide_estimated_tokens": tree_metrics["average_guide_estimated_tokens"],
+        "verification": verification_metrics(verification),
+        "project_map": {
+            "file_count": project_map.get("file_count"),
+            "scanned_file_count": project_map.get("scanned_file_count"),
+            "language_file_counts": project_map.get("language_file_counts"),
+            "module_candidate_count": len(project_map.get("module_candidates", []))
+            if isinstance(project_map.get("module_candidates"), list)
+            else 0,
+            "graphify": project_map.get("graphify"),
+        },
+        "latest_build_metrics": latest_build_metrics(state_dir),
+    }
+    if start_build:
+        build_output = start_guidance_build(root, reason="benchmark-build", launcher=launcher, codex_command=codex_command)
+        output["started_build"] = build_output
+        output["total_duration_seconds"] = round(time.perf_counter() - started, 3)
+    return output
+
+
+def safe_ratio(numerator: int | float, denominator: int | float) -> float | None:
+    if denominator == 0:
+        return None
+    return round(float(numerator) / float(denominator), 3)
+
+
+def compare_graphify(
+    repo_arg: Path,
+    query_text: str | None = None,
+    use_graphify: bool = True,
+    run_graphify: bool = False,
+    graphify_budget: int = 1200,
+    graphify_command: str | None = None,
+) -> dict[str, Any]:
+    root, _ = repo_root(repo_arg)
+    benchmark = benchmark_build(root)
+    graphify_meta = graphify_graph_metadata(root)
+    project_map_bytes = int(benchmark.get("project_map_bytes") or 0)
+    graph_bytes = int(graphify_meta.get("size_bytes") or 0)
+    query_result: dict[str, Any] | None = None
+    query_duration_seconds: float | None = None
+    if query_text:
+        query_started = time.perf_counter()
+        try:
+            query_result = guidance_query(
+                root,
+                query_text,
+                use_graphify=use_graphify,
+                budget=graphify_budget,
+                run_graphify=False,
+                graphify_command=graphify_command,
+            )
+            query_duration_seconds = round(time.perf_counter() - query_started, 3)
+            if run_graphify and graphify_meta.get("available"):
+                graphify_run = run_graphify_query(root, query_text, graphify_budget, graphify_command)
+                if isinstance(query_result.get("graphify"), dict):
+                    query_result["graphify"]["query_result"] = graphify_run
+        except GuidanceMapError as exc:
+            graphify_run = (
+                run_graphify_query(root, query_text, graphify_budget, graphify_command)
+                if run_graphify and graphify_meta.get("available")
+                else None
+            )
+            query_duration_seconds = round(time.perf_counter() - query_started, 3)
+            query_result = {
+                "status": "guidance_unavailable",
+                "message": str(exc),
+                "graphify": {
+                    **graphify_meta,
+                    "query_result": graphify_run,
+                },
+            }
+    return {
+        "status": "compared",
+        "repo_root": str(root),
+        "cpgm": {
+            "project_map_file": benchmark.get("project_map_file"),
+            "project_map_bytes": project_map_bytes,
+            "scan_duration_seconds": benchmark.get("scan_duration_seconds"),
+            "agents_bytes": benchmark.get("agents_bytes"),
+            "module_guide_count": benchmark.get("module_guide_count"),
+            "module_guide_bytes": benchmark.get("module_guide_bytes"),
+            "manifest_bytes": benchmark.get("manifest_bytes"),
+            "tree_guide_count": benchmark.get("tree_guide_count"),
+            "parent_guide_count": benchmark.get("parent_guide_count"),
+            "leaf_guide_count": benchmark.get("leaf_guide_count"),
+            "tree_guide_bytes": benchmark.get("tree_guide_bytes"),
+            "average_tree_guide_bytes": benchmark.get("average_tree_guide_bytes"),
+            "average_tree_guide_estimated_tokens": benchmark.get("average_tree_guide_estimated_tokens"),
+            "verification": benchmark.get("verification"),
+            "project_map": benchmark.get("project_map"),
+            "latest_build_metrics": benchmark.get("latest_build_metrics"),
+        },
+        "graphify": graphify_meta,
+        "comparison": {
+            "project_map_vs_graph_size_ratio": safe_ratio(project_map_bytes, graph_bytes),
+            "graph_json_vs_project_map_size_ratio": safe_ratio(graph_bytes, project_map_bytes),
+            "cpgm_prescan_llm_tokens": 0,
+            "graphify_ast_llm_tokens": 0 if graphify_meta.get("available") else None,
+            "context_policy": "Use AGENTS.md/module guides for editing; use graphify query/path as evidence; never load graph.json directly.",
+            "file_query_duration_seconds": query_duration_seconds,
+            "file_query_selected_guide_count": len(query_result.get("recommended_guide_paths") or query_result.get("recommended_module_guides") or [])
+            if isinstance(query_result, dict)
+            else None,
+            "file_query_selected_context_bytes": sum(
+                file_size_or_zero(root / str(path))
+                for path in (query_result.get("recommended_guide_paths") or query_result.get("recommended_module_guides") or [])
+            )
+            if isinstance(query_result, dict)
+            else None,
+            "graphify_query_duration_seconds": (
+                query_result.get("graphify", {}).get("query_result", {}).get("duration_seconds")
+                if isinstance(query_result, dict) and isinstance(query_result.get("graphify"), dict) and isinstance(query_result.get("graphify", {}).get("query_result"), dict)
+                else None
+            ),
+            "graphify_query_output_estimated_tokens": (
+                query_result.get("graphify", {}).get("query_result", {}).get("stdout_estimated_tokens")
+                if isinstance(query_result, dict) and isinstance(query_result.get("graphify"), dict) and isinstance(query_result.get("graphify", {}).get("query_result"), dict)
+                else None
+            ),
+        },
+        "query": query_result,
     }
 
 
@@ -2145,8 +4261,16 @@ def update(repo_arg: Path, guidance_file: Path, timestamp: str | None) -> dict[s
     if not signature_key_available or signature_secret is None:
         raise GuidanceMapError("Unable to create or load the signature key.")
     local_baseline = local_change_baseline(root, git_available)
-    signed_modules = sign_module_guides(root, guidance, timestamp, baseline, key_id, signature_secret)
-    guidance = update_module_index_signatures(guidance, signed_modules)
+    manifest_rel, manifest_digest, guide_entries = write_tree_guides_and_manifest(
+        root,
+        guidance,
+        timestamp,
+        baseline,
+        local_baseline,
+        key_id,
+        signature_secret,
+    )
+    guidance = guidance_body_with_manifest(guidance, manifest_rel, manifest_digest)
     validate_guidance_shape(guidance)
     block = render_block(guidance, timestamp, baseline, key_id, signature_secret, local_change_baseline_value=local_baseline)
     updated = update_agents_text(existing, block)
@@ -2155,12 +4279,51 @@ def update(repo_arg: Path, guidance_file: Path, timestamp: str | None) -> dict[s
         "repo_root": str(root),
         "agents_path": str(agents_path),
         "has_block": True,
+        "guide_format": GUIDE_FORMAT,
         "generated_at": timestamp,
         "git_baseline": baseline,
         "local_change_baseline": local_baseline,
         "signature_key_id": key_id,
         "signature_key_source": signature_key_source,
-        "modules": signed_modules,
+        "manifest_path": manifest_rel,
+        "manifest_digest": manifest_digest,
+        "guides": guide_entries,
+        "guide_count": len(guide_entries),
+    }
+
+
+def cleanup_legacy_modules(repo_arg: Path, apply: bool = False) -> dict[str, Any]:
+    root, _ = repo_root(repo_arg)
+    manifest = read_json_file(manifest_path(root))
+    referenced = {
+        str(entry.get("path") or "")
+        for entry in manifest.get("guides", [])
+        if isinstance(entry, dict)
+    }
+    legacy_dir = root / ".agents" / "guidance-map" / "modules"
+    legacy_files = sorted(legacy_dir.glob("*.md")) if legacy_dir.exists() else []
+    candidates = [
+        path
+        for path in legacy_files
+        if repo_relative(root, path) not in referenced
+    ]
+    removed: list[str] = []
+    if apply:
+        for path in candidates:
+            path.unlink()
+            removed.append(repo_relative(root, path))
+        try:
+            if legacy_dir.exists() and not any(legacy_dir.iterdir()):
+                legacy_dir.rmdir()
+        except OSError:
+            pass
+    return {
+        "repo_root": str(root),
+        "status": "cleaned" if apply else "dry_run",
+        "legacy_module_count": len(legacy_files),
+        "candidate_count": len(candidates),
+        "candidates": [repo_relative(root, path) for path in candidates],
+        "removed": removed,
     }
 
 
@@ -2179,11 +4342,27 @@ def main() -> int:
         default="never",
         help="Exit with code 1 when the selected condition is met.",
     )
+    verify_parser.add_argument("--full", action="store_true", help="Validate every manifest-backed guide digest and source snapshot.")
+
+    scan_parser = subparsers.add_parser("scan", help="Write the deterministic project-map pre-scan artifact.")
+    scan_parser.add_argument("--repo", default=".", help="Repository or project directory.")
+
+    query_parser = subparsers.add_parser("query", help="Recommend module guides and paths for a task.")
+    query_parser.add_argument("query", help="Task or codebase question to route through the guidance map.")
+    query_parser.add_argument("--repo", default=".", help="Repository or project directory.")
+    query_parser.add_argument("--use-graphify", action="store_true", help="Include a graphify query command when graphify-out/graph.json exists.")
+    query_parser.add_argument("--run-graphify", action="store_true", help="Run graphify query and capture bounded output; implies --use-graphify.")
+    query_parser.add_argument("--graphify-budget", type=int, default=1200, help="Token budget passed to the suggested graphify query command.")
+    query_parser.add_argument("--graphify-command", help="Graphify command prefix; defaults to `uvx --from graphifyy graphify` or CODE_PROJECT_GUIDANCE_MAP_GRAPHIFY_COMMAND.")
 
     update_parser = subparsers.add_parser("update", help="Create or replace the signed AGENTS.md project index.")
     update_parser.add_argument("--repo", default=".", help="Repository or project directory.")
     update_parser.add_argument("--guidance-file", required=True, help="Markdown file containing the project index draft.")
     update_parser.add_argument("--timestamp", help="ISO-8601 timestamp override for tests.")
+
+    cleanup_parser = subparsers.add_parser("cleanup-legacy", help="List or remove unreferenced legacy v3 module guides.")
+    cleanup_parser.add_argument("--repo", default=".", help="Repository or project directory.")
+    cleanup_parser.add_argument("--apply", action="store_true", help="Actually remove candidate legacy module guide files.")
 
     build_parser = subparsers.add_parser("build", help="Start or coordinate the single guidance-map builder agent.")
     build_parser.add_argument("--repo", default=".", help="Repository or project directory.")
@@ -2196,8 +4375,8 @@ def main() -> int:
         choices=("auto", "cli", "desktop"),
         default=None,
         help=(
-            "Builder launcher. auto uses Desktop handoff from Codex Desktop unless a Codex command is explicitly "
-            "configured; otherwise it uses CLI."
+            "Builder launcher. auto uses a runnable Codex CLI when available, then falls back to Desktop manual "
+            "handoff inside Codex Desktop; desktop is an explicit thread-tool handoff path."
         ),
     )
     build_parser.add_argument("--model", help="Optional model passed through to `codex exec`.")
@@ -2240,14 +4419,40 @@ def main() -> int:
     finish_parser.add_argument("--message", help="Optional finish message.")
     finish_parser.add_argument("--force", action="store_true", help="Release even when pending contexts exist.")
 
+    benchmark_parser = subparsers.add_parser("benchmark-build", help="Collect deterministic build-readiness and last-build metrics.")
+    benchmark_parser.add_argument("--repo", default=".", help="Repository or project directory.")
+    benchmark_parser.add_argument("--start-build", action="store_true", help="Also start the coordinated builder after collecting benchmark inputs.")
+    benchmark_parser.add_argument("--launcher", choices=("auto", "cli", "desktop"), default=None, help="Launcher to use with --start-build.")
+    benchmark_parser.add_argument("--codex-command", help="Command used to launch Codex when --start-build is set.")
+
+    compare_parser = subparsers.add_parser("compare-graphify", help="Compare CPGM deterministic artifacts with a local graphify graph.")
+    compare_parser.add_argument("--repo", default=".", help="Repository or project directory.")
+    compare_parser.add_argument("--query", help="Optional task query to route through CPGM and optionally graphify.")
+    compare_parser.add_argument("--run-graphify", action="store_true", help="Run graphify query when --query and graphify-out/graph.json are available.")
+    compare_parser.add_argument("--graphify-budget", type=int, default=1200, help="Token budget passed to graphify query.")
+    compare_parser.add_argument("--graphify-command", help="Graphify command prefix; defaults to `uvx --from graphifyy graphify` or CODE_PROJECT_GUIDANCE_MAP_GRAPHIFY_COMMAND.")
+
     args = parser.parse_args()
     try:
         if args.command == "status":
             output = status(Path(args.repo))
         elif args.command == "verify":
-            output = verify(Path(args.repo))
+            output = verify(Path(args.repo), full=args.full)
+        elif args.command == "scan":
+            output = write_project_map(Path(args.repo), verify(Path(args.repo)))
+        elif args.command == "query":
+            output = guidance_query(
+                Path(args.repo),
+                args.query,
+                use_graphify=args.use_graphify or args.run_graphify,
+                budget=args.graphify_budget,
+                run_graphify=args.run_graphify,
+                graphify_command=args.graphify_command,
+            )
         elif args.command == "update":
             output = update(Path(args.repo), Path(args.guidance_file), args.timestamp)
+        elif args.command == "cleanup-legacy":
+            output = cleanup_legacy_modules(Path(args.repo), apply=args.apply)
         elif args.command == "build":
             output = start_guidance_build(
                 Path(args.repo),
@@ -2265,6 +4470,21 @@ def main() -> int:
             output = attach_desktop_builder_thread(Path(args.repo), args.build_id, args.thread_id)
         elif args.command == "build-drain":
             output = drain_build_context(Path(args.repo), args.build_id)
+        elif args.command == "benchmark-build":
+            output = benchmark_build(
+                Path(args.repo),
+                start_build=args.start_build,
+                launcher=args.launcher,
+                codex_command=args.codex_command,
+            )
+        elif args.command == "compare-graphify":
+            output = compare_graphify(
+                Path(args.repo),
+                query_text=args.query,
+                run_graphify=args.run_graphify,
+                graphify_budget=args.graphify_budget,
+                graphify_command=args.graphify_command,
+            )
         else:
             output = finish_guidance_build(
                 Path(args.repo),

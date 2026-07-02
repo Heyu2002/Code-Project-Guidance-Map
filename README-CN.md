@@ -6,7 +6,11 @@
 
 Code Project Guidance Map 是一个 Codex plugin + skill，用来把项目结构沉淀成 Codex 可复用的项目记忆。
 
-它的目标不是生成一大篇项目手册，而是在项目根目录生成一个紧凑的 `AGENTS.md` 项目行动索引，并把模块内部细节拆到 `.agents/guidance-map/modules/` 下的独立 Markdown 文件中。
+它的目标不是生成一大篇项目手册，而是在项目根目录生成一个紧凑的 `AGENTS.md` 项目行动索引，并把模块内部细节拆到 `.agents/guidance-map/guides/` 下的 manifest-backed 分层 Markdown 文件中。
+
+## graphify 对比摘要
+
+完整报告见 [docs/graphify-comparison.md](docs/graphify-comparison.md)。一句话：当前插件是 Codex 编辑路由记忆层，graphify 是可查询知识图谱索引。本轮新增 deterministic pre-scan 后，`compare-graphify` 在四个 Java/Python/Rust/C# 样本上产出 0-token CPGM project-map，最终复测耗时约 0.9s-1.4s，体积比对应 graphify JSON 小 8.7x-135.3x；但 graphify 仍然更适合符号邻居、调用路径和影响面深查。推荐落地方式是先用 CPGM 的 `project-map`/`AGENTS.md` 做编辑范围路由，再用 graphify 对疑难模块做结构检索。
 
 ## 背景
 
@@ -25,10 +29,10 @@ Code Project Guidance Map 是一个 Codex plugin + skill，用来把项目结构
 - 由主 agent 根据浅层仓库信号决定宏观模块划分。
 - 强制使用有边界的模块 subagents 阅读模块内部，并为每个模块组写一个独立模块 guide；默认限制为每次构建最多同时运行 3 个模块 subagent、总共最多创建 8 个模块 subagent。
 - 让 `AGENTS.md` 只保存项目级索引：全局编辑规则、任务路由、依赖规则和模块链接。
-- 把模块内部结构、关键入口和局部规则保存到 `.agents/guidance-map/modules/*.md`。
-- 给每个模块 guide 生成独立签名，再把模块签名写回 `AGENTS.md`。
-- 给 `AGENTS.md` 索引生成总签名，用来检测人工修改、模块链接损坏或签名不一致。
-- 根据 Git 变化增量刷新受影响模块，而不是每次全量重读项目。
+- 把模块内部结构、关键入口和局部规则保存到 `.agents/guidance-map/guides/**`。
+- 写入 `.agents/guidance-map/manifest.json`，记录 guide id、父子关系、tags、source globs、content digest 和 source snapshot。
+- 给 `AGENTS.md` 索引和 manifest 生成签名，用来检测人工修改、manifest 替换、guide 路径逃逸或 guide 内容篡改。
+- 根据 Git 变化增量刷新受影响 guide，而不是每次全量重读项目。
 - 刷新时记录一个已签名的本地变更基线，让刷新时已经存在的 dirty worktree 文件不会在内容未变时反复触发 stale。
 - 通过轻量 hooks 在 `SessionStart`、`UserPromptSubmit` 和 `Stop` 时检查指引是否缺失、过期或无法验签。
 
@@ -39,15 +43,18 @@ Code Project Guidance Map 是一个 Codex plugin + skill，用来把项目结构
 <!-- code-project-guidance-map:end -->
 ```
 
-模块 guide 文件有自己的签名 marker：
+tree guide 文件有自己的 metadata marker；可信性来自 manifest 中的 content digest，而不是每个文件本地 HMAC：
 
 ```markdown
-<!-- code-project-guidance-map:module:start -->
-Signature: hmac-sha256:<64 lowercase hex chars>
-<!-- code-project-guidance-map:module:end -->
+<!-- code-project-guidance-map:guide:start -->
+Guide ID: backend.api.controllers
+Guide kind: leaf
+Guide path: .agents/guidance-map/guides/backend/api/controllers.md
+Parent guide ID: backend.api
+<!-- code-project-guidance-map:guide:end -->
 ```
 
-当前生成器版本是 `0.2.1`，当前 guide 格式是 `action-map:v3`。版本缺失、格式非法，或 major/minor 不兼容时需要完整刷新。只有 patch 版本不同会被视为兼容。
+当前生成器版本是 `0.3.0`，当前 guide 格式是 `action-map:v4`。旧的 `action-map:v3` 产物仍可被 `status/verify/query` 识别，但下一次 refresh 会统一升级为 v4 manifest-backed guide tree。版本缺失、格式非法，或 major/minor 不兼容时需要完整刷新。只有 patch 版本不同会被视为兼容。
 
 本地变更的新鲜度按内容判断。`Generated at` 用来界定已提交 Git 历史；已签名的 `Local change baseline` 会记录上次刷新时已经存在的 staged、unstaged 和 untracked 文件内容。新开 Codex thread 时，同一批 dirty 文件只要内容没再变化，就不应该再次要求刷新。
 
@@ -82,8 +89,23 @@ codex plugin add code-project-guidance-map@code-project-guidance-map
 安装后，在你想生成指引的项目中新开一个 Codex 线程，然后输入：
 
 ```text
-Use $code-project-guidance-map to create or refresh this repository's signed AGENTS.md project index and per-module guide files. First decide macro module boundaries from shallow repo signals, then spawn bounded module subagents to create or refresh `.agents/guidance-map/modules/*.md`, then use the helper to sign module guides, link them from AGENTS.md, and sign the aggregate index. Do not do module-internal reading in the main thread.
+Use $code-project-guidance-map to create or refresh this repository's signed AGENTS.md project index and manifest-backed guide tree. First decide macro guide-tree boundaries from shallow repo signals, then spawn bounded module subagents to create or refresh `.agents/guidance-map/guides/**`, then use the helper to write the manifest, record guide digests/source snapshots, and sign AGENTS.md. Do not do module-internal reading in the main thread.
 ```
+
+构建 helper 默认使用 `guidance_map.py build --launcher auto`。`auto` 会优先通过 `codex exec` 启动 builder，因此 agent 环境里需要有可运行的 `codex` 命令，或者设置 `CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND` / `--codex-command` 指向可运行的 Codex CLI。不要假设安装 Codex Desktop 后所有用户都会自动拥有可被脚本调用的 CLI；如果没有 CLI 但当前请求运行在 Codex Desktop 中，`auto` 会返回 `desktop_manual_handoff_required`，并生成 `.handoff.md`、短 `codex://new?path=...&prompt=...` deep link、attach 命令和失败清理命令，用户可以用新的本地 Desktop thread 接力 builder。`--launcher desktop` 仅保留给确实具备 Desktop thread creation tool 的环境作为显式 handoff 路径。
+
+每次 build 都会在项目 build state 的 `logs/` 目录下写入 `*.prompt.md`、`*.jsonl`、`*.last-message.md` 和 `*.metrics.json`；Desktop handoff 还会写入 `*.handoff.md`。CLI builder 启动后会等待 JSONL 或 last-message 启动信号，如果进程存活但一直没有任何输出，会尽早报错而不是留下一个静默 lease。`verify` 默认忽略 `graphify-out/`、`node_modules/`、缓存、build 目录、coverage 和编译产物，这些路径会出现在 `changed_files_by_source.tool_ignored` 中，但不会让 guidance 变 stale。
+
+也可以不启动 builder，直接使用本地确定性能力：
+
+```powershell
+python <installed-skill>\scripts\guidance_map.py scan --repo .
+python <installed-skill>\scripts\guidance_map.py query "add an API controller" --repo .
+python <installed-skill>\scripts\guidance_map.py benchmark-build --repo .
+python <installed-skill>\scripts\guidance_map.py compare-graphify --repo . --query "add an API controller"
+```
+
+`scan` 会写入 `.agents/guidance-map/project-map.json`，包含文件树、语言、manifest、模块候选、import、changed files 和 graphify 可用性摘要。`query` 会基于 signed manifest 和 guide tree 推荐 guide、源码路径、测试路径，以及可选 graphify query 命令；命中的 guide 会先校验 content digest，篡改过的 guide 不会作为可信建议返回。只有显式传入 `--run-graphify` 时才会实际运行 graphify query 并截取输出。`compare-graphify` 会把 CPGM 的 project-map/tree-query metrics 和本地 graphify graph metadata 放在同一个 JSON 中。
 
 ## 如何使用
 
@@ -107,7 +129,7 @@ Use $code-project-guidance-map, then help me identify where this feature should 
 
 ## 渐进式披露
 
-生成的指引是分层的。后续 Codex 会话应该先读紧凑的 `AGENTS.md` 索引，再根据 `Task Routing`、`Module Index` 和 `verify.affected_modules` 选择相关模块，只打开命中的模块 guide。模块 guide 是懒加载上下文，不是启动上下文；普通任务通常只需要在编辑前读取 1-3 个相关模块 guide。
+生成的指引是分层的。后续 Codex 会话应该先读紧凑的 `AGENTS.md` 索引，再运行 `guidance_map.py query "<task>"` 选择 manifest-verified guide，只打开命中的 guide。guide 是懒加载上下文，不是启动上下文；普通任务通常只需要在编辑前读取 1-5 个相关 guide。
 
 模块索引条目可以包含可选的懒加载提示：
 
@@ -129,8 +151,8 @@ hooks 是只读的。它们会验证当前仓库的 `AGENTS.md` 索引和模块 
 ## Code Project Guidance Map
 
 Generator: code-project-guidance-map
-Generator version: 0.2.1
-Guide format: action-map:v3
+Generator version: 0.3.0
+Guide format: action-map:v4
 Generated at: 2026-06-15T10:30:00Z
 Git baseline: abc1234
 Signature key id: repo:1a2b3c4d5e6f7890
@@ -146,9 +168,9 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 ### Progressive Disclosure
 
 - Start with this `AGENTS.md` index for broad orientation.
-- Read a module guide only when task routing, changed files, `verify.affected_modules`, or module index fields indicate that module is relevant.
-- Prefer reading 1-3 module guides before editing unless the task is explicitly cross-module or project-wide.
-- Do not open every linked module guide for ordinary orientation.
+- Use `guidance_map.py query "<task>"` before opening guide files.
+- Read only manifest-verified guide files returned by query unless the task is explicitly cross-module or project-wide.
+- Do not open the whole guide tree for ordinary orientation.
 
 ### Task Routing
 
@@ -160,18 +182,10 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 - Shared utilities are the lowest-level code and must not depend on business, web, or persistence modules.
 - API modules call services; services own business rules; persistence modules own storage adapters and SQL.
 
-### Module Index
+### Guidance Manifest
 
-#### Scheduling
-
-- Module Path: `src/core/scheduling`
-- Module Guide: `.agents/guidance-map/modules/scheduling.md`
-- Module Signature: `hmac-sha256:<64 lowercase hex chars>`
-- Owns: Scheduling rules, shift rotation decisions, and scheduling-domain service behavior.
-- Change here when: A task changes how schedules are calculated, validated, or persisted through domain services.
-- Do not put here: HTTP response shaping, frontend-only DTOs, or generic shared helpers.
-- Read guide when: Editing scheduling rules, scheduling services, strategies, tests, or schedule persistence behavior.
-- Usually skip when: Only changing API response shaping, frontend DTOs, documentation, or generic shared helpers.
+Guidance manifest: `.agents/guidance-map/manifest.json`
+Guidance manifest digest: `sha256:<64 lowercase hex chars>`
 <!-- code-project-guidance-map:end -->
 ````
 

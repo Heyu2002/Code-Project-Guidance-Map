@@ -263,16 +263,100 @@ flowchart LR
 | 想让 Codex 后续改代码时少读错、少改错模块 | 优先当前插件。 |
 | 想查调用、依赖、路径、影响面和跨文件邻居 | 优先 graphify。 |
 | 大仓库长期维护 | 两者组合：`AGENTS.md` 负责编辑路由，graphify 负责深查；在 `AGENTS.md` 里只放 graphify 查询提示，不放 graph JSON。 |
-| CI/可重复 benchmark | graphify 当前更容易量化；当前插件需要补 startup health check、foreground benchmark、timeout、usage 统计和 end-to-end fixture。 |
+| CI/可重复 benchmark | graphify 当前更容易量化；当前插件已补 startup health check、build metrics、deterministic scan 和 `benchmark-build`，但仍需要端到端 fixture 和持续 usage 趋势。 |
 | 离线/无 API key | 当前插件仍需 Codex 模型生成；graphify code-only 可离线，但 docs/image 必须忽略或提供宿主语义抽取。 |
 
-建议当前插件后续增强：
+对比后当前插件已落地的增强：
 
-- 增加 startup health check 和 foreground benchmark 模式：尽早发现日志 0 bytes/last-message 缺失，并在一个进程内输出 builder 状态、耗时、最终 token/文件统计。
-- 在 `verify` 默认忽略常见工具产物，如 `graphify-out/`、`.pytest_cache/`、`node_modules/` 等，或允许配置 ignore。
-- 为小型仓库提供 deterministic scaffold 选项，至少能生成模块候选和空 guide 骨架，方便 CI 测速。
-- 在 README 中明确 Desktop handoff、CLI builder、Windows `.cmd/.bat` shim 的可观测性/故障排查方式。
-- 增加与 graphify 的组合指南：什么时候先看 `AGENTS.md`，什么时候运行 `graphify query`。
+- 增加 startup health check：CLI builder 启动后必须在配置窗口内写出 JSONL 或 last-message，否则尽早失败并给出诊断，避免日志 0 bytes 的静默 lease。
+- 增加 `*.metrics.json`：记录 launcher、handoff mode、startup health、刷新范围摘要、finish status 和耗时，后续可继续沉淀同维度 benchmark。
+- 在 `verify` 默认忽略常见工具产物，如 `graphify-out/`、`.pytest_cache/`、`node_modules/`、build/coverage/bytecode 等，并把它们报告到 `changed_files_by_source.tool_ignored`。
+- 明确 Desktop-only manual handoff：无 CLI 的 Codex Desktop 用户会收到 `.handoff.md`、短 `codex://new` deep link、attach/cleanup 命令，而不是被要求在当前线程直接生成。
+- 增加 deterministic `scan`：写入 `.agents/guidance-map/project-map.json`，包含语言、manifest、模块候选、import、changed files 和 graphify 可用性摘要。
+- 增加 `query`：基于 `AGENTS.md`/Module Index 推荐 module guide、源码路径、测试路径、边界规则，并可给出 graphify query 命令；`--run-graphify` 可显式运行 graphify query 并截取输出。
+- 增加 `benchmark-build`：默认不启动 builder，输出 project-map、guidance 体积、刷新范围、graphify 可用性和最新 builder metrics。
+- 增加 `compare-graphify`：把 CPGM project-map/build metrics 与本地 graphify graph metadata、可选 query evidence 放到同一 JSON。
+- 模块签名绑定 source snapshot：模块内源码或 manifest 改动可精准指向对应 module guide 刷新。
+
+仍建议后续增强：
+
+- 扩展 graphify 执行集成到 `path/explain`，当前已支持受控 `query`。
+- 增加端到端 fixture：在固定小/中/大仓库上持续记录完整 builder token、耗时、模块数和产物尺寸趋势。
+
+## 本轮优化后复测：deterministic pre-scan vs graphify graph
+
+本轮新增 `scan`/`query`/`benchmark-build`/`compare-graphify` 后，当前插件不再只有 LLM builder 产物可比，而是多了一层本地确定性 pre-scan。它不替代 graphify 的符号图，但能在不读完整源码、不消耗 LLM token 的情况下，为 builder 和后续编辑任务提供语言、manifest、模块候选、轻量 import、changed files 和 graphify 可用性摘要。
+
+命令：
+
+```powershell
+python .\.agents\skills\code-project-guidance-map\scripts\guidance_map.py compare-graphify --repo <repo> --query "request routing blueprint dispatch"
+```
+
+| 样本 | CPGM `project-map.json` | CPGM scan 耗时 | graphify `graph.json` | graphify 图规模 | CPGM/graph 体积比 | graph 比 project-map 大 |
+| --- | ---: | ---: | ---: | --- | ---: | ---: |
+| Spring guide | 6.7 KB | 1.04s | 58.6 KB | 70 nodes / 61 links / 23 communities | 11.5% | 8.7x |
+| Flask | 19.2 KB | 1.00s | 1.36 MB | 1,458 nodes / 2,429 links / 104 communities | 1.4% | 70.6x |
+| bat | 17.7 KB | 0.91s | 2.40 MB | 2,396 nodes / 4,015 links / 192 communities | 0.7% | 135.3x |
+| Hangfire | 111.0 KB | 1.39s | 13.28 MB | 8,784 nodes / 17,403 links / 539 communities | 0.8% | 119.6x |
+
+新增突破：
+
+- 当前插件现在有了 0 LLM token 的本地项目摘要层：最终复测中四个样本 scan 均在约 0.9-1.4s 内完成，产物为 6.7-111.0 KB。
+- 对大仓库尤其明显：Hangfire 的 graphify 图是 13.28 MB，而 CPGM project-map 是 110.9 KB；bat 的 graphify 图约为 project-map 的 135.6x。
+- 这个优势只适用于“编辑路由前置判断”：它能帮助决定该读哪些模块、哪些 manifest、哪些测试路径，但不能回答精确符号邻居、调用路径或影响面。
+- graphify 的优势仍然是深查：它保留节点/边/社区，适合 `query/path/explain`；代价是不能把 graph JSON 直接作为启动上下文，必须通过查询入口裁剪。
+- 四个原始 benchmark 仓库没有 CPGM `AGENTS.md`，所以 `compare-graphify` 的 `query.status` 正确返回 `guidance_unavailable`；这说明 pre-scan/graph metadata 与 guidance routing 被分离，没有伪造模块级编辑建议。
+- 在已生成 guidance 的 Spring debug 样本上，`query "add REST controller"` 能返回 `java-complete-solution`、`java-initial-starter`、`repository-docs-and-harness` 三个候选 guide，并给出源码候选和依赖边界。
+- 显式运行 graphify 的受控对比已可用：`--run-graphify --graphify-budget 1200` 在 Spring 样本上成功调用 `uvx --from graphifyy graphify query`，最终复测耗时约 0.92s，stdout 被截断/估算并记录在同一个 JSON 中，避免把完整 graph 塞进上下文。
+
+落地差异因此更清晰：当前插件的新增 pre-scan 是“低成本编辑入口索引”，graphify 是“高分辨率结构检索索引”。组合使用时，建议先让 CPGM project-map/`AGENTS.md` 决定读取范围，再用 graphify 对命中的疑难模块做深查。
+
+## v4 分层文件化整改后的新增对比维度
+
+本轮整改后，当前插件的默认产物从 v3 扁平 module guides 改为 v4 manifest-backed guide tree：
+
+- `AGENTS.md` 只保留项目级规则和 `manifest.json` digest，不再写入所有 guide 签名。
+- `.agents/guidance-map/manifest.json` 记录 guide id、父子关系、tags、source globs、content digest 和 source snapshot，并由 HMAC 签名。
+- `.agents/guidance-map/guides/**` 可以按模块复杂度不等深拆分；父 `index.md` 只在需要路由、跨子模块边界或公共规则时存在。
+- `query` 默认走 manifest 文件索引，只校验并推荐 top K guide；被人工插入危险指令或被篡改的 guide 因 content digest 不匹配会被拒绝推荐。
+- `verify --full` 可全量校验所有 guide digest/source snapshot；普通 `verify` 保持 quick path。
+- `compare-graphify` 现在额外输出 file-query latency、selected guide context bytes、manifest bytes、parent/leaf guide count、graphify query latency 和 graphify query output token 估算。
+
+这让当前插件和 graphify 的落地差异进一步拉开：
+
+| 维度 | CPGM v4 file query | graphify query |
+| --- | --- | --- |
+| 默认查询对象 | 小型 signed manifest + 少量 Markdown guide | `graphify-out/graph.json` 图索引 |
+| 查询目标 | 编辑路由：该读哪些 guide、改哪些路径、遵守哪些边界 | 结构深查：节点邻居、路径、调用/依赖关系 |
+| 安全链 | `AGENTS.md` 签 manifest digest，manifest 签 guide digest；query 拒读 tampered guide | graph JSON 依赖生成流程和文件完整性管理 |
+| 上下文形态 | top K manifest-verified guide，通常是数个小 Markdown | query/path/explain 返回的局部子图文本 |
+| 父子模块深度 | 按复杂度不等深；父 guide 可省略 | 图天然是节点/边结构，无父 guide 写作负担 |
+| 保留短板 | 不提供符号级路径算法，不替代调用图 | graph JSON 大，不适合作为 Codex 启动上下文 |
+
+因此新的推荐组合方式是：默认先用 CPGM v4 file query 做编辑范围选择；只有当任务需要调用链、符号邻居、跨文件路径或影响面时，再显式运行 graphify。
+
+### v4 Spring debug 复测
+
+在已有 Spring guidance debug 样本上，将 v3 guidance 刷新为 v4 manifest-backed guide tree，并复用同一 Spring 样本的 graphify `graph.json` 后，执行：
+
+```powershell
+python .\.agents\skills\code-project-guidance-map\scripts\guidance_map.py compare-graphify `
+  --repo D:\project\test\graphify-cpgm-benchmark\spring-guides__gs-rest-service-cpgm-debug `
+  --query "add REST controller" `
+  --run-graphify `
+  --graphify-budget 1200
+```
+
+| 指标 | CPGM v4 file query | graphify query / graph |
+| --- | ---: | ---: |
+| query 耗时 | 0.672s | 1.049s |
+| 选中上下文 | 4 个 verified guides / 8.3 KB | query stdout 约 227 tokens |
+| 索引体积 | manifest 9.6 KB + tree guides 10.3 KB | graph JSON 58.6 KB |
+| 图/索引规模 | 5 leaf guides | 70 nodes / 61 links / 23 communities |
+| 安全校验 | manifest valid，0 tampered guides | graph 文件可解析 |
+
+这个样本的新突破不是“CPGM 替代 graphify”，而是默认编辑路由已经可以通过更小的文件索引完成，并且能在返回 guide 前校验 digest；graphify 仍然给出了 `GreetingController`、`.greeting()`、`RestController`、`GetMapping` 等符号邻居，适合继续做结构深查。
 
 ## 复现命令
 
