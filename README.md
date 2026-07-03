@@ -8,6 +8,23 @@ Code Project Guidance Map is a Codex plugin and skill that turns repository stru
 
 It does not try to generate a giant project manual. It creates a compact `AGENTS.md` project action index, then stores module-specific detail in a manifest-backed guide tree under `.agents/guidance-map/guides/`.
 
+## Repomix Comparison Summary
+
+See [docs/repomix-comparison.md](docs/repomix-comparison.md) for the full same-dimension benchmark against [Repomix](https://github.com/yamadashy/repomix). The benchmark used four freshly cloned remote repositories under `D:\project\test\repomix-cpgm-benchmark-20260703`, covering Python, Java, C#, and Rust projects from small/simple to large/complex. None of the samples had prior Code Project Guidance Map or Repomix artifacts before the run.
+
+Short version: Repomix is excellent when you want a fast, one-command full repository context package. Code Project Guidance Map is stronger when Codex needs a reusable, reviewable, signed editing route that keeps startup and task context small. In this run, Repomix full output ranged from 38,214 to 863,168 tokens, and `--compress` still ranged from 31,916 to 750,059 tokens; CPGM query selected 756 to 843 estimated guide tokens. That means Repomix full context was 50.5x to 1040.0x larger than the CPGM selected guide context, while compressed Repomix was still 42.2x to 903.7x larger.
+
+The table below summarizes the practical advantage split: use Repomix for portable full-context snapshots, and use this plugin for Codex editing memory, manifest-backed trust, and task-routed lazy context.
+
+| Dimension | Code Project Guidance Map advantage | Repomix advantage | Measured evidence from this run | Practical difference |
+|---|---|---|---|---|
+| Default context shape | Tiny `AGENTS.md` plus lazy manifest-verified guide files. | Single AI-friendly full-repo file in Markdown/XML/JSON/plain text. | CPGM selected 4.3-6.2 KB per query; Repomix full output was 125.8 KB-2.95 MB. | CPGM is better for repeated Codex edits; Repomix is better for one-shot upload or paste workflows. |
+| Token pressure | Task query returned only 756-843 estimated guide tokens. | Provides explicit token totals for the packed repository. | Repomix full was 38,214-863,168 tokens; compressed was 31,916-750,059 tokens. | CPGM reduces routine task context; Repomix makes total context cost visible. |
+| Trust and freshness | Signed manifest, guide content digests, source snapshots, and `verify --full`. | Built-in suspicious-file/security check during packing. | All four CPGM manifests were valid with 0 tampered and 0 stale guides; all Repomix runs passed security check. | CPGM catches guidance tampering and stale guide scope; Repomix helps avoid leaking suspicious packed content. |
+| Query and routing | `guidance_map.py query "<task>"` returns top guide paths, source candidates, and verified guide count. | Output file can be searched or handed to any LLM/tool. | CPGM query took 1.139-1.280s and selected 5 verified guides. | CPGM gives Codex an editing route; Repomix gives a portable corpus. |
+| Setup speed | Deterministic scan took 0.800-1.300s. | Cached `npx repomix` full pack took 4.044-4.513s with no project-specific guidance draft. | CPGM scan is faster, but deterministic update + full verify + query makes initialization about 6.4-9.3s. | Repomix wins simplest first package; CPGM pays setup cost for reusable signed routing. |
+| Long-term project memory | Artifacts can live in git, be reviewed, queried, and checked in CI. | Generated output is usually disposable or regenerated. | CPGM wrote compact `AGENTS.md`, manifest, and 7-9 guide files per sample. | CPGM is a project memory layer; Repomix is a context export layer. |
+
 ## graphify Comparison Summary
 
 See [docs/graphify-comparison.md](docs/graphify-comparison.md) for the full benchmark against [graphify](https://github.com/safishamsi/graphify) on fresh remote Java, Python, Rust, and C# repositories.
