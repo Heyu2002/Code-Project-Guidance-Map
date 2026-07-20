@@ -11,7 +11,7 @@ graphify：`graphifyy 0.9.3`, GitHub HEAD `69b3997`
 | --- | --- | --- |
 | 核心定位 | 给 Codex 留一份可验证、可增量刷新的项目编辑地图。 | 把代码/文档语料抽成可查询的知识图谱。 |
 | 最适合 | 后续 agent 要快速判断“该读哪个模块、该改哪里、哪些边界不能破坏”。 | 要查调用/依赖/概念路径、做跨文件问答、用图查询压缩上下文。 |
-| 落地形态 | `AGENTS.md` 小索引 + `.agents/guidance-map/modules/*.md` 懒加载模块指南，HMAC 签名。 | `graphify-out/graph.json` + `GRAPH_REPORT.md` + 可选 HTML/MCP/IDE hook。 |
+| 落地形态 | `AGENTS.md` 小索引 + `.agents/guidance-map/guides/**/*.md` 懒加载模块指南，各产物独立短自哈希。 | `graphify-out/graph.json` + `GRAPH_REPORT.md` + 可选 HTML/MCP/IDE hook。 |
 | 首次产出速度 | `verify` 0.46-0.71s；Spring 小样本完整生成 6m14s，生成 `AGENTS.md` 8.6 KB + 5 个 module guide 10.2 KB。初次默认 CLI 失败已定位为 Windows `codex.CMD` shim 启动问题。 | AST-only 全流程 2.65s/5.78s/23.92s/64.30s，随仓库规模增长。 |
 | Token/上下文 | 脚本校验不耗 LLM token；Spring 完整生成日志为 `input_tokens=870,007`，其中 `cached_input_tokens=802,944`，`output_tokens=11,904`，`reasoning_output_tokens=3,976`。消费侧目标是只读 `AGENTS.md` + 1-3 个模块 guide。 | AST-only `input_tokens=0/output_tokens=0`；query 输出约 362-950 token；自带 benchmark 估算查询比全量上下文少 10.4x-23.7x。 |
 | 安装难度 | Codex 插件市场安装，强绑定 Codex；生成路径要求 builder 与子代理能力。 | `uvx`/`uv tool install` 即可跑 CLI，平台覆盖广；全仓库 headless 遇到 docs/image 需要 LLM backend/API key 或宿主 agent 语义抽取。 |
@@ -36,7 +36,7 @@ graphify：`graphifyy 0.9.3`, GitHub HEAD `69b3997`
 | 多语言表现 | 语言无关，理论上只要 Codex 能读项目即可产出模块指南。 | 依赖 Codex 理解和生成，缺少各语言 AST 的确定性边。 | Java/Python/Rust/C# 样本均可 AST-only 产出图。 | 语言覆盖受 graphify extractor 能力和文件类型支持影响。 | 当前插件跨语言靠 LLM 总结；graphify跨语言靠 extractor。 |
 | 查询/定位 | 通过 Task Routing 指向模块和文件范围，适合编辑前选上下文。 | 不能直接回答“从 A 到 B 的调用路径”。 | `query/path/explain` 可以定位相关节点和结构路径。 | 查询质量依赖问题措辞、命名和图质量。 | 编辑前路由用当前插件；深查路径用 graphify。 |
 | 编辑约束 | 明确写出 MUST/SHOULD/AVOID、依赖边界和模块所有权。 | 规则需要维护，过期后会误导 agent。 | 可发现关系，但不会天然生成编辑约束。 | 图本身不告诉 agent “不要改哪里”或“应该同步哪些约定”。 | 当前插件直接影响编码行为；graphify提供证据，约束要另写。 |
-| 增量与一致性 | HMAC 签名、generator version、local change baseline 和单 builder 租约可检测 stale/broken guidance。 | 与外部产物共存时，未跟踪文件如 `graphify-out/` 会干扰 changed files，需 ignore。 | manifest/cache/update 适合图索引增量维护。 | 图文件自身无签名约束，真实性依赖生成流程和文件管理。 | 当前插件重视指导文件可信度；graphify重视索引更新效率。 |
+| 增量与一致性 | 各产物自哈希、generator version、manifest local change baseline 和单 builder 租约可检测 stale/broken guidance；短哈希不提供身份认证。 | 与外部产物共存时，未跟踪文件如 `graphify-out/` 会干扰 changed files，需 ignore。 | manifest/cache/update 适合图索引增量维护。 | 图文件完整性依赖生成流程和文件管理。 | 当前插件重视指导文件的局部完整性与低改写；graphify重视索引更新效率。 |
 | 安装运行 | 作为 Codex 插件和 skill，落地到 Codex 原生协作方式。 | 强绑定 Codex；完整生成需要 builder/subagent，Windows shim 还需要启动兼容。 | `uvx --from graphifyy graphify ...` 可直接跑，平台覆盖更广。 | headless 全仓库遇到 docs/image 常要配置 `.graphifyignore` 或 API/backend。 | Codex 内编辑用当前插件更顺；跨工具/CLI 检索用 graphify更顺。 |
 | CI/benchmark | `verify` 很适合做快速健康检查。 | 完整生成还需要 startup health check、foreground benchmark、timeout 和 usage 统计。 | AST-only extract/cluster/benchmark 更容易纳入 CI。 | semantic extraction 和 query 质量受配置影响，raw benchmark 有格式坑。 | 当前插件 CI 适合校验 guidance 状态；graphify CI 适合校验图生成和规模趋势。 |
 | 离线能力 | 不需要外部 API key，但需要 Codex 模型/会话来生成完整 map。 | 无 Codex builder 时只能 `verify`，不能完整生成。 | code-only AST 可离线，0 LLM token。 | docs/PDF/image 不能完全离线，除非忽略或接入宿主语义抽取。 | 离线代码结构抽取 graphify 占优；Codex 项目记忆当前插件占优。 |
@@ -71,7 +71,7 @@ graphify：`graphifyy 0.9.3`, GitHub HEAD `69b3997`
 | 网络/图格式 | 非图数据库格式；是人类可读的 action map：编辑规则、任务路由、模块索引、模块签名。 | JSON 图。raw `--no-cluster` 为 `{nodes, edges, hyperedges, input_tokens, output_tokens}`；`cluster-only` 后为 NetworkX node-link：`directed, multigraph, graph, nodes, links, hyperedges, built_at_commit`。 |
 | 节点粒度 | 模块/路径/责任边界。 | 文件、类、函数、方法、类型、manifest、符号等。 |
 | 边/关系 | 通过文字规则表达依赖方向和编辑边界。 | `contains`、`imports`、`references`、`calls`、`method` 等，带 `confidence`、`source_file`、`source_location`。 |
-| 完整性校验 | 项目索引和模块 guide 均 HMAC 签名；本地 dirty baseline 可避免重复 stale 提醒。 | 图文件自身无签名；通过 manifest/cache/update 维护增量。 |
+| 完整性校验 | 项目索引、manifest 和模块 guide 各自短自哈希；manifest dirty baseline 可避免重复 stale 提醒。 | 图文件通过 manifest/cache/update 维护增量，完整性依赖生成流程。 |
 | 上下文策略 | agent 先读 `AGENTS.md`，再按任务读 1-3 个模块 guide。 | agent 先 `graphify query/path/explain`，再读 query 返回的源文件。 |
 
 示例 graphify clustered node/link：
@@ -228,7 +228,7 @@ flowchart LR
 
 - `AGENTS.md` 是低摩擦入口，后续 Codex 线程自然会使用。
 - 模块 guide 懒加载，避免每次启动读取整份项目说明。
-- 签名、版本、local change baseline 和 `verify` 让 stale/missing/broken guidance 可检测。
+- 自哈希、版本、manifest local change baseline 和 `verify` 让 stale/missing/broken guidance 可检测。
 - 单 builder 租约避免多个 agent 同时重写项目记忆。
 - 更关注“该改哪里/不要改哪里/依赖边界”，对实际编码任务直接。
 
@@ -317,9 +317,9 @@ python .\.agents\skills\code-project-guidance-map\scripts\guidance_map.py compar
 本轮整改后，当前插件的默认产物从 v3 扁平 module guides 改为 v4 manifest-backed guide tree：
 
 - `AGENTS.md` 只保留项目级规则和 `manifest.json` digest，不再写入所有 guide 签名。
-- `.agents/guidance-map/manifest.json` 记录 guide id、父子关系、tags、source globs、content digest 和 source snapshot，并由 HMAC 签名。
+- `.agents/guidance-map/manifest.json` 记录 freshness 游标、guide id、父子关系、tags、source globs 和 source snapshot，并仅对自身内容保存短自哈希。
 - `.agents/guidance-map/guides/**` 可以按模块复杂度不等深拆分；父 `index.md` 只在需要路由、跨子模块边界或公共规则时存在。
-- `query` 默认走 manifest 文件索引，只校验并推荐 top K guide；被人工插入危险指令或被篡改的 guide 因 content digest 不匹配会被拒绝推荐。
+- `query` 默认走 manifest 文件索引，只校验并推荐 top K guide；被人工插入危险指令或被篡改的 guide 因自身 content hash 或 manifest 身份绑定失败会被拒绝推荐。
 - `verify --full` 可全量校验所有 guide digest/source snapshot；普通 `verify` 保持 quick path。
 - `compare-graphify` 现在额外输出 file-query latency、selected guide context bytes、manifest bytes、parent/leaf guide count、graphify query latency 和 graphify query output token 估算。
 
@@ -327,9 +327,9 @@ python .\.agents\skills\code-project-guidance-map\scripts\guidance_map.py compar
 
 | 维度 | CPGM v4 file query | graphify query |
 | --- | --- | --- |
-| 默认查询对象 | 小型 signed manifest + 少量 Markdown guide | `graphify-out/graph.json` 图索引 |
+| 默认查询对象 | 小型 self-hashed manifest + 少量 Markdown guide | `graphify-out/graph.json` 图索引 |
 | 查询目标 | 编辑路由：该读哪些 guide、改哪些路径、遵守哪些边界 | 结构深查：节点邻居、路径、调用/依赖关系 |
-| 安全链 | `AGENTS.md` 签 manifest digest，manifest 签 guide digest；query 拒读 tampered guide | graph JSON 依赖生成流程和文件完整性管理 |
+| 完整性边界 | `AGENTS.md`、manifest、guide 各自仅校验自身；query 拒读自哈希或身份绑定失败的 guide | graph JSON 依赖生成流程和文件完整性管理 |
 | 上下文形态 | top K manifest-verified guide，通常是数个小 Markdown | query/path/explain 返回的局部子图文本 |
 | 父子模块深度 | 按复杂度不等深；父 guide 可省略 | 图天然是节点/边结构，无父 guide 写作负担 |
 | 保留短板 | 不提供符号级路径算法，不替代调用图 | graph JSON 大，不适合作为 Codex 启动上下文 |

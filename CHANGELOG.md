@@ -8,6 +8,9 @@ This project follows semantic versioning for the guidance generator version. Pat
 
 ### Added
 
+- Added `action-map:v5` with independent 16-hex SHA-256-derived self-hashes for `AGENTS.md`, the manifest, and every guide. Each artifact now verifies only its own content; these hashes provide change detection, not authentication.
+- Added strict v4/v5 schema selection from the `AGENTS.md` guide format and manifest-to-guide identity checks for guide id, kind, and path.
+- Added regression coverage proving non-structural refreshes preserve `AGENTS.md` byte-for-byte while freshness cursors continue to advance in the manifest.
 - Added `action-map:v4` manifest-backed guide trees under `.agents/guidance-map/guides/**`, with `.agents/guidance-map/manifest.json` as the signed machine-readable index.
 - Added high-integrity guide validation: `AGENTS.md` signs the manifest digest, the manifest signs guide content digests/source snapshots, guide paths are constrained to the guide tree, and `query` refuses tampered guide files.
 - Added v4 file-query routing that scores manifest guide entries by task tokens, tags, read/skip triggers, source globs, changed files, and parent/child relationships before verifying only the selected top guides.
@@ -30,6 +33,9 @@ This project follows semantic versioning for the guidance generator version. Pat
 
 ### Changed
 
+- Moved `Generated at`, `Git baseline`, and `Local change baseline` out of `AGENTS.md` and into the v5 manifest, removing freshness-only churn from the project index.
+- Changed incremental refresh so implementation, guide-detail, and freshness changes update guides/manifest only. `AGENTS.md` is rewritten only when its project-level rules, routing, dependency boundaries, manifest pointer, or guide-tree topology actually change.
+- Removed signing-key creation and cross-artifact digest ownership from new v5 output. Legacy v3/v4 verification remains available for migration.
 - Replaced the `SessionStart` and `UserPromptSubmit` hooks with a modification-only `Stop` hook driven by Git-visible changes.
 - Added read-only builder status checks so an active CLI or Desktop builder suppresses Stop continuation; caller threads now finalize immediately after start, queue, or handoff instead of waiting for builder completion.
 - Changed fresh `update` output from v3 flat module guides to v4 `AGENTS.md` + signed manifest + mixed-depth guide tree. Legacy v3 blocks remain inspectable/queryable, and refresh rewrites them into v4.

@@ -1,4 +1,4 @@
 interface:
   display_name: "Code Project Guidance Map"
-  short_description: "Create signed AGENTS.md indexes and module guides"
-  default_prompt: "Use $code-project-guidance-map to refresh the signed AGENTS.md guidance map via its single builder."
+  short_description: "Create self-hashed AGENTS.md indexes and guides"
+  default_prompt: "Use $code-project-guidance-map to refresh the self-hashed AGENTS.md guidance map via its single builder."

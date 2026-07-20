@@ -28,15 +28,21 @@ from typing import Any, Iterable
 START_MARKER = "<!-- code-project-guidance-map:start -->"
 END_MARKER = "<!-- code-project-guidance-map:end -->"
 GENERATOR = "code-project-guidance-map"
-GENERATOR_VERSION = "0.3.0"
-GUIDE_FORMAT = "action-map:v4"
-LEGACY_GUIDE_FORMATS = {"action-map:v3"}
+GENERATOR_VERSION = "0.4.0"
+GUIDE_FORMAT = "action-map:v5"
+LEGACY_GUIDE_FORMATS = {"action-map:v3", "action-map:v4"}
 SUPPORTED_GUIDE_FORMATS = {GUIDE_FORMAT, *LEGACY_GUIDE_FORMATS}
+MANIFEST_GUIDE_FORMATS = {GUIDE_FORMAT, "action-map:v4"}
 SIGNATURE_ALGORITHM = "hmac-sha256:v2"
+CONTENT_HASH_PREFIX = "sha256:"
+CONTENT_HASH_HEX_LENGTH = 16
 MODULE_START_MARKER = "<!-- code-project-guidance-map:module:start -->"
 MODULE_END_MARKER = "<!-- code-project-guidance-map:module:end -->"
 TREE_GUIDE_START_MARKER = "<!-- code-project-guidance-map:guide:start -->"
 TREE_GUIDE_END_MARKER = "<!-- code-project-guidance-map:guide:end -->"
+GUIDE_ID_RE = re.compile(r"^Guide ID:\s*(?P<value>.+?)\s*$", re.MULTILINE)
+GUIDE_KIND_RE = re.compile(r"^Guide kind:\s*(?P<value>.+?)\s*$", re.MULTILINE | re.IGNORECASE)
+GUIDE_PATH_RE = re.compile(r"^Guide path:\s*(?P<value>.+?)\s*$", re.MULTILINE | re.IGNORECASE)
 PROJECT_MAP_RELATIVE_PATH = ".agents/guidance-map/project-map.json"
 MANIFEST_RELATIVE_PATH = ".agents/guidance-map/manifest.json"
 GUIDES_RELATIVE_DIR = ".agents/guidance-map/guides"
@@ -72,6 +78,7 @@ LOCAL_CHANGE_BASELINE_RE = re.compile(r"^Local change baseline:\s*(?P<value>.+?)
 SIGNATURE_KEY_ID_RE = re.compile(r"^Signature key id:\s*(?P<value>.+?)\s*$", re.MULTILINE)
 SIGNATURE_ALGORITHM_RE = re.compile(r"^Signature algorithm:\s*(?P<value>.+?)\s*$", re.MULTILINE)
 SIGNATURE_RE = re.compile(r"^Signature:\s*(?P<value>.+?)\s*$", re.MULTILINE)
+CONTENT_HASH_RE = re.compile(r"^Content hash:\s*(?P<value>.+?)\s*$", re.MULTILINE)
 MANIFEST_PATH_RE = re.compile(r"^Guidance manifest:\s*(?P<value>.+?)\s*$", re.MULTILINE)
 MANIFEST_DIGEST_RE = re.compile(r"^Guidance manifest digest:\s*(?P<value>.+?)\s*$", re.MULTILINE)
 SECTION_HEADING_RE = re.compile(r"^### (?!#)(?P<title>.+?)\s*$", re.MULTILINE)
@@ -233,7 +240,8 @@ SCAN_MAX_IMPORT_FILES = 400
 SCAN_MAX_IMPORTS_PER_FILE = 12
 QUERY_MAX_MODULES = 3
 QUERY_MAX_GUIDES = 5
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
+LEGACY_MANIFEST_SCHEMA_VERSION = 1
 GRAPHIFY_QUERY_TIMEOUT_SECONDS = 60.0
 GRAPHIFY_OUTPUT_MAX_CHARS = 12000
 DOCS_PATTERNS = (
@@ -919,6 +927,26 @@ def pretty_json(payload: dict[str, Any]) -> str:
 
 def sha256_text(text: str) -> str:
     return f"sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()}"
+
+
+def short_content_hash(text: str) -> str:
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:CONTENT_HASH_HEX_LENGTH]
+    return f"{CONTENT_HASH_PREFIX}{digest}"
+
+
+def content_hash_value_is_valid(value: object) -> bool:
+    return isinstance(value, str) and bool(
+        re.fullmatch(rf"sha256:[0-9a-f]{{{CONTENT_HASH_HEX_LENGTH}}}", value)
+    )
+
+
+def text_without_content_hash_line(text: str) -> str:
+    return re.sub(r"^Content hash:\s*.+?\r?\n", "", text, count=1, flags=re.MULTILINE)
+
+
+def self_content_hash(text: str) -> str:
+    canonical = text_without_content_hash_line(text).strip() + "\n"
+    return short_content_hash(canonical)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -2113,11 +2141,18 @@ def compute_signature(
 
 def guidance_body_from_block(block: str) -> str | None:
     lines = block.splitlines()
-    signature_index = next((index for index, line in enumerate(lines) if line.startswith("Signature:")), None)
-    if signature_index is None:
+    integrity_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.startswith("Content hash:") or line.startswith("Signature:")
+        ),
+        None,
+    )
+    if integrity_index is None:
         return None
 
-    body_start = signature_index + 1
+    body_start = integrity_index + 1
     if body_start < len(lines) and not lines[body_start].strip():
         body_start += 1
 
@@ -2127,6 +2162,23 @@ def guidance_body_from_block(block: str) -> str | None:
 
     guidance = "\n".join(lines[body_start:body_end]).strip()
     return guidance or None
+
+
+def agents_content_hash_is_valid(block: str | None, content_hash: str | None) -> bool:
+    if (
+        not block
+        or len(CONTENT_HASH_RE.findall(block)) != 1
+        or not content_hash_value_is_valid(content_hash)
+        or GENERATED_AT_RE.search(block)
+        or GIT_BASELINE_RE.search(block)
+        or LOCAL_CHANGE_BASELINE_RE.search(block)
+        or SIGNATURE_KEY_ID_RE.search(block)
+        or SIGNATURE_ALGORITHM_RE.search(block)
+        or SIGNATURE_RE.search(block)
+        or MANIFEST_DIGEST_RE.search(block)
+    ):
+        return False
+    return str(content_hash) == self_content_hash(block)
 
 
 def signature_is_valid(
@@ -2453,7 +2505,7 @@ def tree_guide_body_from_text(text: str) -> str:
     return f"{text[:start].rstrip()}\n\n{text[end:].lstrip()}".strip()
 
 
-def render_tree_guide_metadata(descriptor: dict[str, Any]) -> str:
+def render_tree_guide_metadata(descriptor: dict[str, Any], content_hash: str | None = None) -> str:
     lines = [
         TREE_GUIDE_START_MARKER,
         f"Guide ID: {descriptor['id']}",
@@ -2462,6 +2514,8 @@ def render_tree_guide_metadata(descriptor: dict[str, Any]) -> str:
     ]
     if descriptor.get("parent_id"):
         lines.append(f"Parent guide ID: {descriptor['parent_id']}")
+    if content_hash:
+        lines.append(f"Content hash: {content_hash}")
     lines.append(TREE_GUIDE_END_MARKER)
     return "\n".join(lines)
 
@@ -2470,7 +2524,9 @@ def render_tree_guide_text(descriptor: dict[str, Any], body: str) -> str:
     body = body.strip()
     if not body:
         raise GuidanceMapError(f"Guide '{descriptor['title']}' is empty.")
-    return f"{render_tree_guide_metadata(descriptor)}\n\n{body}\n"
+    unsigned = f"{render_tree_guide_metadata(descriptor)}\n\n{body}\n"
+    content_hash = self_content_hash(unsigned)
+    return f"{render_tree_guide_metadata(descriptor, content_hash)}\n\n{body}\n"
 
 
 def guide_source_snapshot(root: Path, source_globs: list[str]) -> str:
@@ -2507,7 +2563,6 @@ def guide_file_entry(root: Path, descriptor: dict[str, Any]) -> dict[str, Any]:
         "owns": descriptor.get("owns") or "",
         "change_here_when": descriptor.get("change_here_when") or "",
         "do_not_put_here": descriptor.get("do_not_put_here") or "",
-        "content_digest": guide_content_digest(text),
         "source_snapshot": guide_source_snapshot(root, unique_ordered(descriptor.get("source_globs") or [])),
         "size_bytes": len(text.encode("utf-8")),
         "estimated_tokens": estimate_text_tokens(text),
@@ -2517,6 +2572,21 @@ def guide_file_entry(root: Path, descriptor: dict[str, Any]) -> dict[str, Any]:
 def manifest_signature_payload(manifest: dict[str, Any]) -> str:
     unsigned = {key: value for key, value in manifest.items() if key != "signature"}
     return canonical_json(unsigned)
+
+
+def manifest_content_hash_payload(manifest: dict[str, Any]) -> str:
+    unsigned = {key: value for key, value in manifest.items() if key != "content_hash"}
+    return canonical_json(unsigned)
+
+
+def compute_manifest_content_hash(manifest: dict[str, Any]) -> str:
+    return short_content_hash(manifest_content_hash_payload(manifest))
+
+
+def manifest_content_hash_is_valid(manifest: dict[str, Any] | None) -> bool:
+    if not isinstance(manifest, dict) or not content_hash_value_is_valid(manifest.get("content_hash")):
+        return False
+    return manifest.get("content_hash") == compute_manifest_content_hash(manifest)
 
 
 def compute_manifest_signature(
@@ -2553,8 +2623,6 @@ def write_tree_guides_and_manifest(
     timestamp: str,
     baseline: str,
     local_baseline: str,
-    key_id: str,
-    secret: bytes,
 ) -> tuple[str, str, list[dict[str, Any]]]:
     descriptors = guide_index_descriptors(root, guidance)
     if not descriptors:
@@ -2583,11 +2651,9 @@ def write_tree_guides_and_manifest(
         "generated_at": timestamp,
         "git_baseline": baseline,
         "local_change_baseline": local_baseline,
-        "signature_algorithm": SIGNATURE_ALGORITHM,
-        "signature_key_id": key_id,
         "guides": guide_entries,
     }
-    manifest["signature"] = compute_manifest_signature(secret, manifest, timestamp, baseline, key_id, local_baseline)
+    manifest["content_hash"] = compute_manifest_content_hash(manifest)
     digest, text = manifest_digest_for_payload(manifest)
     write_text(manifest_path(root), text)
     return MANIFEST_RELATIVE_PATH, digest, guide_entries
@@ -2622,12 +2688,21 @@ def read_manifest_payload(root: Path, manifest_rel: str | None) -> tuple[dict[st
 
 def manifest_signature_is_valid(
     manifest: dict[str, Any] | None,
+    guide_format: str | None,
     timestamp: str | None,
     baseline: str | None,
     key_id: str | None,
     local_change_baseline_value: str | None,
     secret: bytes | None,
 ) -> bool:
+    if guide_format == GUIDE_FORMAT:
+        return bool(
+            isinstance(manifest, dict)
+            and manifest.get("schema_version") == MANIFEST_SCHEMA_VERSION
+            and manifest_content_hash_is_valid(manifest)
+        )
+    if guide_format != "action-map:v4":
+        return False
     if (
         manifest is None
         or not timestamp
@@ -2643,9 +2718,15 @@ def manifest_signature_is_valid(
     return hmac.compare_digest(str(manifest.get("signature")), expected)
 
 
-def validate_manifest_shape(manifest: dict[str, Any] | None) -> bool:
-    if not manifest or manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+def validate_manifest_shape(manifest: dict[str, Any] | None, guide_format: str | None = None) -> bool:
+    expected_schema = MANIFEST_SCHEMA_VERSION if guide_format == GUIDE_FORMAT else LEGACY_MANIFEST_SCHEMA_VERSION
+    if (
+        not manifest
+        or manifest.get("schema_version") != expected_schema
+        or manifest.get("guide_format") != guide_format
+    ):
         return False
+    schema_version = manifest.get("schema_version")
     guides = manifest.get("guides")
     if not isinstance(guides, list) or not guides:
         return False
@@ -2664,7 +2745,10 @@ def validate_manifest_shape(manifest: dict[str, Any] | None) -> bool:
             return False
         seen_ids.add(guide_id)
         seen_paths.add(guide_path)
-        if not isinstance(entry.get("content_digest"), str) or not str(entry.get("content_digest")).startswith("sha256:"):
+        if schema_version == LEGACY_MANIFEST_SCHEMA_VERSION:
+            if not isinstance(entry.get("content_digest"), str) or not str(entry.get("content_digest")).startswith("sha256:"):
+                return False
+        elif "content_digest" in entry:
             return False
         if not isinstance(entry.get("source_snapshot"), str) or not str(entry.get("source_snapshot")).startswith("sha256:"):
             return False
@@ -2679,7 +2763,12 @@ def guide_entry_path_is_safe(root: Path, entry: dict[str, Any]) -> bool:
     return True
 
 
-def guide_entry_content_status(root: Path, entry: dict[str, Any], check_source_snapshot: bool = False) -> dict[str, Any]:
+def guide_entry_content_status(
+    root: Path,
+    entry: dict[str, Any],
+    check_source_snapshot: bool = False,
+    self_hashed: bool = False,
+) -> dict[str, Any]:
     guide_path_raw = str(entry.get("path") or "")
     result: dict[str, Any] = {
         "id": entry.get("id"),
@@ -2688,6 +2777,8 @@ def guide_entry_content_status(root: Path, entry: dict[str, Any], check_source_s
         "kind": entry.get("kind") or "leaf",
         "exists": False,
         "path_safe": False,
+        "identity_valid": False,
+        "content_hash": None,
         "content_digest": None,
         "expected_content_digest": entry.get("content_digest"),
         "content_valid": False,
@@ -2704,9 +2795,27 @@ def guide_entry_content_status(root: Path, entry: dict[str, Any], check_source_s
     if not guide_path.exists():
         return result
     text = read_text(guide_path)
-    digest = guide_content_digest(text)
-    result["content_digest"] = digest
-    result["content_valid"] = digest == entry.get("content_digest")
+    guide_id = strip_inline_code(metadata_value(GUIDE_ID_RE, text) or "")
+    guide_kind = strip_inline_code(metadata_value(GUIDE_KIND_RE, text) or "")
+    guide_path_value = strip_inline_code(metadata_value(GUIDE_PATH_RE, text) or "")
+    result["identity_valid"] = bool(
+        guide_id == str(entry.get("id") or "")
+        and guide_kind.casefold() == str(entry.get("kind") or "leaf").casefold()
+        and guide_path_value.replace("\\", "/") == guide_path_raw.replace("\\", "/")
+    )
+    if not self_hashed:
+        digest = guide_content_digest(text)
+        result["content_digest"] = digest
+        result["content_valid"] = bool(result["identity_valid"] and digest == entry.get("content_digest"))
+    else:
+        content_hash = metadata_value(CONTENT_HASH_RE, text)
+        result["content_hash"] = content_hash
+        result["content_valid"] = bool(
+            result["identity_valid"]
+            and len(CONTENT_HASH_RE.findall(text)) == 1
+            and content_hash_value_is_valid(content_hash)
+            and content_hash == self_content_hash(text)
+        )
     if check_source_snapshot:
         source_snapshot = guide_source_snapshot(root, unique_ordered(entry.get("source_globs") or []))
         result["source_snapshot"] = source_snapshot
@@ -2717,6 +2826,7 @@ def guide_entry_content_status(root: Path, entry: dict[str, Any], check_source_s
 def manifest_status(
     root: Path,
     guidance: str | None,
+    guide_format: str | None,
     timestamp: str | None,
     baseline: str | None,
     key_id: str | None,
@@ -2727,9 +2837,20 @@ def manifest_status(
 ) -> dict[str, Any]:
     manifest_rel, indexed_digest = manifest_metadata_from_guidance(guidance)
     manifest, manifest_abs, actual_digest = read_manifest_payload(root, manifest_rel)
-    digest_matches = bool(indexed_digest and actual_digest and indexed_digest == actual_digest)
-    shape_valid = validate_manifest_shape(manifest)
-    signature_valid = manifest_signature_is_valid(manifest, timestamp, baseline, key_id, local_change_baseline_value, secret)
+    self_hashed_manifest = guide_format == GUIDE_FORMAT
+    digest_matches = None if self_hashed_manifest else bool(
+        indexed_digest and actual_digest and indexed_digest == actual_digest
+    )
+    shape_valid = validate_manifest_shape(manifest, guide_format)
+    signature_valid = manifest_signature_is_valid(
+        manifest,
+        guide_format,
+        timestamp,
+        baseline,
+        key_id,
+        local_change_baseline_value,
+        secret,
+    )
     changed_set = set(changed or [])
     guide_entries = manifest.get("guides") if isinstance(manifest, dict) and isinstance(manifest.get("guides"), list) else []
     changed_guide_entries = [
@@ -2739,7 +2860,12 @@ def manifest_status(
     ]
     checked_entries = guide_entries if full else changed_guide_entries
     guide_statuses = [
-        guide_entry_content_status(root, entry, check_source_snapshot=full)
+        guide_entry_content_status(
+            root,
+            entry,
+            check_source_snapshot=full,
+            self_hashed=self_hashed_manifest,
+        )
         for entry in checked_entries
         if isinstance(entry, dict)
     ]
@@ -2767,7 +2893,15 @@ def manifest_status(
         "manifest_digest_matches_agents": digest_matches,
         "manifest_shape_valid": shape_valid,
         "manifest_signature_valid": signature_valid,
-        "manifest_valid": bool(manifest and digest_matches and shape_valid and signature_valid and not unsafe_manifest_paths),
+        "manifest_content_hash": manifest.get("content_hash") if isinstance(manifest, dict) else None,
+        "manifest_content_hash_valid": manifest_content_hash_is_valid(manifest) if self_hashed_manifest else None,
+        "manifest_valid": bool(
+            manifest
+            and (self_hashed_manifest or digest_matches)
+            and shape_valid
+            and signature_valid
+            and not unsafe_manifest_paths
+        ),
         "manifest_guide_count": len(guide_entries),
         "tampered_guides": tampered,
         "stale_guides": stale,
@@ -3255,9 +3389,9 @@ def validate_guidance_shape(guidance: str) -> None:
                 raise GuidanceMapError(f"Guide '{guide_name}' is missing required field: Guide ID.")
         return
     if guidance_manifest is not None:
-        manifest_rel, manifest_digest = manifest_metadata_from_guidance(stripped)
-        if not manifest_rel or not manifest_digest:
-            raise GuidanceMapError("Guidance Manifest must include Guidance manifest and Guidance manifest digest lines.")
+        manifest_rel, _ = manifest_metadata_from_guidance(stripped)
+        if not manifest_rel:
+            raise GuidanceMapError("Guidance Manifest must include a Guidance manifest line.")
         return
     modules = module_entries(module_index)
     if not modules:
@@ -3286,23 +3420,7 @@ def render_block(
     guidance = guidance.strip()
     if not guidance:
         raise GuidanceMapError("Guidance content is empty.")
-    signature = compute_signature(
-        secret,
-        "project-index",
-        GENERATOR,
-        generator_version,
-        GUIDE_FORMAT,
-        timestamp,
-        baseline,
-        SIGNATURE_ALGORITHM,
-        key_id,
-        guidance,
-        local_change_baseline_value,
-    )
-    local_baseline_lines = []
-    if local_change_baseline_value is not None:
-        local_baseline_lines.append(f"Local change baseline: {local_change_baseline_value}")
-    return "\n".join(
+    unsigned = "\n".join(
         [
             START_MARKER,
             "## Code Project Guidance Map",
@@ -3310,20 +3428,21 @@ def render_block(
             f"Generator: {GENERATOR}",
             f"Generator version: {generator_version}",
             f"Guide format: {GUIDE_FORMAT}",
-            f"Generated at: {timestamp}",
-            f"Git baseline: {baseline}",
-            *local_baseline_lines,
-            f"Signature key id: {key_id}",
-            f"Signature: {signature}",
             "",
             guidance,
             END_MARKER,
             "",
         ]
     )
+    content_hash = self_content_hash(unsigned)
+    return unsigned.replace(
+        f"Guide format: {GUIDE_FORMAT}\n",
+        f"Guide format: {GUIDE_FORMAT}\nContent hash: {content_hash}\n",
+        1,
+    )
 
 
-def guidance_body_with_manifest(guidance: str, manifest_rel: str, manifest_digest: str) -> str:
+def guidance_body_with_manifest(guidance: str, manifest_rel: str, manifest_digest: str | None = None) -> str:
     body = remove_top_level_section(guidance, "Guide Index")
     body = remove_top_level_section(body, "Module Index")
     body = remove_top_level_section(body, "Guidance Manifest")
@@ -3332,7 +3451,6 @@ def guidance_body_with_manifest(guidance: str, manifest_rel: str, manifest_diges
             "### Guidance Manifest",
             "",
             f"Guidance manifest: `{manifest_rel}`",
-            f"Guidance manifest digest: `{manifest_digest}`",
         ]
     )
     return f"{body.strip()}\n\n{manifest_section}".strip()
@@ -3364,17 +3482,37 @@ def status(repo_arg: Path, full: bool = False) -> dict[str, object]:
     text = read_text(agents_path) if exists else ""
     block_info = find_block(text) if exists else None
     block = block_info[2] if block_info else None
-    generated_at = metadata_value(GENERATED_AT_RE, block)
     generator = metadata_value(GENERATOR_RE, block)
     generator_version = metadata_value(GENERATOR_VERSION_RE, block)
     legacy_generated_by = metadata_value(LEGACY_GENERATED_BY_RE, block)
     guide_format = metadata_value(GUIDE_FORMAT_RE, block)
-    git_baseline = metadata_value(GIT_BASELINE_RE, block)
-    local_change_baseline_value = metadata_value(LOCAL_CHANGE_BASELINE_RE, block)
-    local_change_baseline_entries, local_change_baseline_valid = decode_local_change_baseline(local_change_baseline_value)
+    guidance_body = guidance_body_from_block(block) if block else None
+    content_hash = metadata_value(CONTENT_HASH_RE, block)
     signature_key_id = metadata_value(SIGNATURE_KEY_ID_RE, block)
     signature_algorithm = metadata_value(SIGNATURE_ALGORITHM_RE, block)
     signature = metadata_value(SIGNATURE_RE, block)
+    is_current_format = guide_format == GUIDE_FORMAT
+    is_manifest_format = guide_format in MANIFEST_GUIDE_FORMATS
+    preliminary_manifest = None
+    if is_current_format:
+        manifest_rel, _ = manifest_metadata_from_guidance(guidance_body)
+        preliminary_manifest, _, _ = read_manifest_payload(root, manifest_rel)
+    generated_at = (
+        str(preliminary_manifest.get("generated_at") or "") or None
+        if isinstance(preliminary_manifest, dict)
+        else metadata_value(GENERATED_AT_RE, block)
+    )
+    git_baseline = (
+        str(preliminary_manifest.get("git_baseline") or "") or None
+        if isinstance(preliminary_manifest, dict)
+        else metadata_value(GIT_BASELINE_RE, block)
+    )
+    local_change_baseline_value = (
+        str(preliminary_manifest.get("local_change_baseline") or "") or None
+        if isinstance(preliminary_manifest, dict)
+        else metadata_value(LOCAL_CHANGE_BASELINE_RE, block)
+    )
+    local_change_baseline_entries, local_change_baseline_valid = decode_local_change_baseline(local_change_baseline_value)
     parsed_generated_at = parse_iso_datetime(generated_at)
     has_block = block is not None
     generated_at_valid = (not has_block and generated_at is None) or parsed_generated_at is not None
@@ -3386,30 +3524,34 @@ def status(repo_arg: Path, full: bool = False) -> dict[str, object]:
     generator_version_requires_full_read = has_block and version_status in {"missing", "invalid", "incompatible"}
     guide_format_valid = (not has_block and guide_format is None) or guide_format in SUPPORTED_GUIDE_FORMATS
     guide_format_current = (not has_block and guide_format is None) or guide_format == GUIDE_FORMAT
-    signature_secret, signature_key_available, signature_key_source = load_signature_secret(signature_key_id, create=False)
-    signature_valid = (
-        signature_is_valid(
-            block,
-            generator,
-            generator_version,
-            guide_format,
-            generated_at,
-            git_baseline,
-            local_change_baseline_value,
-            signature_algorithm,
-            signature_key_id,
-            signature,
-            signature_secret,
+    signature_secret: bytes | None = None
+    signature_key_available: bool | None = None
+    signature_key_source: str | None = None
+    if has_block and not is_current_format:
+        signature_secret, signature_key_available, signature_key_source = load_signature_secret(signature_key_id, create=False)
+    signature_valid = None
+    if has_block:
+        signature_valid = (
+            agents_content_hash_is_valid(block, content_hash)
+            if is_current_format
+            else signature_is_valid(
+                block,
+                generator,
+                generator_version,
+                guide_format,
+                generated_at,
+                git_baseline,
+                local_change_baseline_value,
+                signature_algorithm,
+                signature_key_id,
+                signature,
+                signature_secret,
+            )
         )
-        if has_block
-        else None
-    )
-    guidance_body = guidance_body_from_block(block) if block else None
     changes = changed_files(root, git_available, parsed_generated_at, local_change_baseline_entries)
-    is_v4 = guide_format == GUIDE_FORMAT
     module_results = (
         []
-        if is_v4
+        if is_manifest_format
         else module_statuses(
             root,
             guidance_body,
@@ -3422,7 +3564,7 @@ def status(repo_arg: Path, full: bool = False) -> dict[str, object]:
     )
     modules_valid = (
         None
-        if is_v4
+        if is_manifest_format
         else bool(module_results)
         and all(
             bool(module["module_guide_exists"])
@@ -3435,6 +3577,7 @@ def status(repo_arg: Path, full: bool = False) -> dict[str, object]:
         manifest_status(
             root,
             guidance_body,
+            guide_format,
             generated_at,
             git_baseline,
             signature_key_id,
@@ -3443,7 +3586,7 @@ def status(repo_arg: Path, full: bool = False) -> dict[str, object]:
             changed=changes["all"],
             full=full,
         )
-        if is_v4
+        if is_manifest_format
         else {
             "manifest_path": None,
             "manifest_abs_path": None,
@@ -3472,12 +3615,12 @@ def status(repo_arg: Path, full: bool = False) -> dict[str, object]:
             or not generated_at_valid
             or not local_change_baseline_valid
             or not signature_valid
-            or (is_v4 and not manifest_result.get("manifest_valid"))
+            or (is_manifest_format and not manifest_result.get("manifest_valid"))
         )
     )
     requires_module_refresh = (
         bool(has_block and not requires_full_read and not modules_valid)
-        if not is_v4
+        if not is_manifest_format
         else bool(manifest_result.get("tampered_guides") or manifest_result.get("stale_guides"))
     )
 
@@ -3507,6 +3650,8 @@ def status(repo_arg: Path, full: bool = False) -> dict[str, object]:
         "signature_algorithm": signature_algorithm,
         "signature": signature,
         "signature_valid": signature_valid,
+        "content_hash": content_hash,
+        "content_hash_valid": signature_valid if is_current_format else None,
         "manifest_path": manifest_result.get("manifest_path"),
         "manifest_abs_path": manifest_result.get("manifest_abs_path"),
         "manifest_exists": manifest_result.get("manifest_exists"),
@@ -3515,6 +3660,8 @@ def status(repo_arg: Path, full: bool = False) -> dict[str, object]:
         "manifest_digest_matches_agents": manifest_result.get("manifest_digest_matches_agents"),
         "manifest_shape_valid": manifest_result.get("manifest_shape_valid"),
         "manifest_signature_valid": manifest_result.get("manifest_signature_valid"),
+        "manifest_content_hash": manifest_result.get("manifest_content_hash"),
+        "manifest_content_hash_valid": manifest_result.get("manifest_content_hash_valid"),
         "manifest_valid": manifest_result.get("manifest_valid"),
         "manifest_guide_count": manifest_result.get("manifest_guide_count"),
         "tampered_guides": manifest_result.get("tampered_guides"),
@@ -3536,8 +3683,8 @@ def verify(repo_arg: Path, full: bool = False) -> dict[str, object]:
     current = status(repo_arg, full=full)
     changed = current["changed_files"]
     impact = classify_changed_files(changed if isinstance(changed, list) else [])
-    is_v4 = current.get("guide_format") == GUIDE_FORMAT
-    if is_v4:
+    is_manifest_format = current.get("guide_format") in MANIFEST_GUIDE_FORMATS
+    if is_manifest_format:
         manifest_payload, _, _ = read_manifest_payload(
             Path(str(current["repo_root"])),
             str(current.get("manifest_path") or "") or None,
@@ -3582,15 +3729,15 @@ def verify(repo_arg: Path, full: bool = False) -> dict[str, object]:
         if current["has_block"] and not current["guide_format_valid"]:
             reasons.append("Guide format is missing or unsupported.")
         if current["has_block"] and current["guide_format_valid"] and not current.get("guide_format_current"):
-            reasons.append("Guide format is legacy; refresh to generate the v4 manifest-backed guide tree.")
+            reasons.append("Guide format is legacy; refresh to generate the v5 self-hashed guide tree.")
         if current["has_block"] and not current["local_change_baseline_valid"]:
             reasons.append("Local change baseline is malformed; refresh the guidance map with the current plugin.")
-        if current["has_block"] and not current["signature_key_available"]:
+        if current["has_block"] and current.get("guide_format") != GUIDE_FORMAT and not current["signature_key_available"]:
             reasons.append("Signature key is unavailable; this block must be refreshed by the plugin or verified with the configured key.")
         if current["has_block"] and not current["signature_valid"]:
-            reasons.append("Signature metadata is missing or invalid.")
-        if is_v4 and not current.get("manifest_valid"):
-            reasons.append("Guidance manifest is missing, unsigned, mismatched with AGENTS.md, malformed, or contains unsafe guide paths.")
+            reasons.append("Content hash or legacy signature metadata is missing or invalid.")
+        if is_manifest_format and not current.get("manifest_valid"):
+            reasons.append("Guidance manifest is missing, has an invalid self hash or legacy signature, is malformed, or contains unsafe guide paths.")
     else:
         if current["generator_version_status"] == "patch-compatible":
             severity = "info"
@@ -3619,7 +3766,7 @@ def verify(repo_arg: Path, full: bool = False) -> dict[str, object]:
         if current.get("requires_module_refresh") and recommended_action in {"none", "review_changed_files"}:
             recommended_action = "refresh_affected_modules"
             severity = "warning"
-            if is_v4:
+            if is_manifest_format:
                 reasons.append("One or more manifest-backed guides are tampered, missing, or no longer match their source snapshot.")
             else:
                 reasons.append("One or more module guide files are missing, unsigned, or no longer match their module source snapshot or signature.")
@@ -3639,7 +3786,7 @@ def verify(repo_arg: Path, full: bool = False) -> dict[str, object]:
         **current,
         "change_impact": impact,
         "affected_modules": affected_modules,
-        "affected_guides": affected_modules if is_v4 else [],
+        "affected_guides": affected_modules if is_manifest_format else [],
         "affected_module_guides": affected_module_guides,
         "unmapped_changed_files": unmapped_changed_files,
         "stale": recommended_action not in {"none", "review_changed_files"},
@@ -3792,7 +3939,7 @@ def guidance_tree_query(
     graphify_command: str | None,
 ) -> dict[str, Any]:
     if not verification.get("signature_valid") or not verification.get("manifest_valid"):
-        raise GuidanceMapError("Guidance manifest or AGENTS.md signature is invalid; refresh before query.")
+        raise GuidanceMapError("Guidance manifest or AGENTS.md content hash/signature is invalid; refresh before query.")
     guides = manifest.get("guides") if isinstance(manifest.get("guides"), list) else []
     if not guides:
         raise GuidanceMapError("Guidance manifest has no guides; refresh before query.")
@@ -3847,7 +3994,12 @@ def guidance_tree_query(
     verified_guides: list[dict[str, Any]] = []
     skipped_guides: list[dict[str, Any]] = []
     for entry in with_parents:
-        status_result = guide_entry_content_status(root, entry, check_source_snapshot=False)
+        status_result = guide_entry_content_status(
+            root,
+            entry,
+            check_source_snapshot=False,
+            self_hashed=verification.get("guide_format") == GUIDE_FORMAT,
+        )
         if status_result.get("path_safe") and status_result.get("exists") and status_result.get("content_valid"):
             verified_guides.append(
                 {
@@ -3858,6 +4010,7 @@ def guidance_tree_query(
                     "why": entry.get("read_when") or entry.get("change_here_when") or entry.get("owns") or "",
                     "avoid": entry.get("do_not_put_here") or "",
                     "estimated_tokens": entry.get("estimated_tokens"),
+                    "content_hash": status_result.get("content_hash"),
                     "content_digest": entry.get("content_digest"),
                 }
             )
@@ -3867,7 +4020,7 @@ def guidance_tree_query(
                     "id": entry.get("id"),
                     "title": entry.get("title"),
                     "path": entry.get("path"),
-                    "reason": "guide digest mismatch, missing file, or unsafe path",
+                    "reason": "guide content hash/digest or identity mismatch, missing file, or unsafe path",
                     "status": status_result,
                 }
             )
@@ -3955,7 +4108,7 @@ def guidance_query(
     root, _ = repo_root(repo_arg)
     verification = verify(root)
     guidance = guidance_body_for_repo(root)
-    if verification.get("guide_format") == GUIDE_FORMAT:
+    if verification.get("guide_format") in MANIFEST_GUIDE_FORMATS:
         manifest, _, _ = read_manifest_payload(root, str(verification.get("manifest_path") or "") or None)
         if not isinstance(manifest, dict):
             raise GuidanceMapError("Guidance manifest is unavailable; refresh before query.")
@@ -4269,6 +4422,32 @@ def compare_graphify(
     }
 
 
+def manifest_structure_view(manifest: dict[str, Any] | None) -> list[dict[str, Any]]:
+    structural_fields = (
+        "id",
+        "title",
+        "parent_id",
+        "path",
+        "kind",
+        "module_path",
+        "source_globs",
+        "tags",
+        "read_when",
+        "skip_when",
+        "owns",
+        "change_here_when",
+        "do_not_put_here",
+    )
+    guides = manifest.get("guides") if isinstance(manifest, dict) else None
+    if not isinstance(guides, list):
+        return []
+    return [
+        {field: entry.get(field) for field in structural_fields}
+        for entry in guides
+        if isinstance(entry, dict)
+    ]
+
+
 def update(repo_arg: Path, guidance_file: Path, timestamp: str | None) -> dict[str, object]:
     root, git_available = repo_root(repo_arg)
     agents_path = root / "AGENTS.md"
@@ -4279,10 +4458,11 @@ def update(repo_arg: Path, guidance_file: Path, timestamp: str | None) -> dict[s
     existing = read_text(agents_path) if agents_path.exists() else ""
     existing_block_info = find_block(existing) if existing else None
     existing_block = existing_block_info[2] if existing_block_info else None
-    key_id = metadata_value(SIGNATURE_KEY_ID_RE, existing_block) or default_signature_key_id(root, git_available)
-    signature_secret, signature_key_available, signature_key_source = load_signature_secret(key_id, create=True)
-    if not signature_key_available or signature_secret is None:
-        raise GuidanceMapError("Unable to create or load the signature key.")
+    current = verify(root) if existing_block else None
+    existing_guidance = guidance_body_from_block(existing_block) if existing_block else None
+    old_manifest = None
+    if isinstance(current, dict) and current.get("guide_format") in MANIFEST_GUIDE_FORMATS:
+        old_manifest, _, _ = read_manifest_payload(root, str(current.get("manifest_path") or "") or None)
     local_baseline = local_change_baseline(root, git_available)
     manifest_rel, manifest_digest, guide_entries = write_tree_guides_and_manifest(
         root,
@@ -4290,14 +4470,26 @@ def update(repo_arg: Path, guidance_file: Path, timestamp: str | None) -> dict[s
         timestamp,
         baseline,
         local_baseline,
-        key_id,
-        signature_secret,
     )
-    guidance = guidance_body_with_manifest(guidance, manifest_rel, manifest_digest)
-    validate_guidance_shape(guidance)
-    block = render_block(guidance, timestamp, baseline, key_id, signature_secret, local_change_baseline_value=local_baseline)
+    new_manifest = read_json_file(manifest_path(root))
+    new_guidance = guidance_body_with_manifest(guidance, manifest_rel)
+    validate_guidance_shape(new_guidance)
+    structure_changed = manifest_structure_view(old_manifest) != manifest_structure_view(new_manifest)
+    project_index_changed = bool(existing_guidance and existing_guidance.strip() != new_guidance.strip())
+    preserve_agents = bool(
+        existing_guidance
+        and isinstance(current, dict)
+        and current.get("guide_format") == GUIDE_FORMAT
+        and current.get("content_hash_valid")
+        and not structure_changed
+        and not project_index_changed
+    )
+    agents_guidance = existing_guidance if preserve_agents else new_guidance
+    block = render_block(agents_guidance, timestamp, baseline, "", b"", local_change_baseline_value=None)
     updated = update_agents_text(existing, block)
-    write_text(agents_path, updated)
+    agents_updated = updated != existing
+    if agents_updated:
+        write_text(agents_path, updated)
     return {
         "repo_root": str(root),
         "agents_path": str(agents_path),
@@ -4306,12 +4498,13 @@ def update(repo_arg: Path, guidance_file: Path, timestamp: str | None) -> dict[s
         "generated_at": timestamp,
         "git_baseline": baseline,
         "local_change_baseline": local_baseline,
-        "signature_key_id": key_id,
-        "signature_key_source": signature_key_source,
+        "content_hash": metadata_value(CONTENT_HASH_RE, block),
         "manifest_path": manifest_rel,
         "manifest_digest": manifest_digest,
         "guides": guide_entries,
         "guide_count": len(guide_entries),
+        "structural_refresh": not preserve_agents,
+        "agents_updated": agents_updated,
     }
 
 
@@ -4378,7 +4571,7 @@ def main() -> int:
     query_parser.add_argument("--graphify-budget", type=int, default=1200, help="Token budget passed to the suggested graphify query command.")
     query_parser.add_argument("--graphify-command", help="Graphify command prefix; defaults to `uvx --from graphifyy graphify` or CODE_PROJECT_GUIDANCE_MAP_GRAPHIFY_COMMAND.")
 
-    update_parser = subparsers.add_parser("update", help="Create or replace the signed AGENTS.md project index.")
+    update_parser = subparsers.add_parser("update", help="Create or refresh the self-hashed AGENTS.md project index.")
     update_parser.add_argument("--repo", default=".", help="Repository or project directory.")
     update_parser.add_argument("--guidance-file", required=True, help="Markdown file containing the project index draft.")
     update_parser.add_argument("--timestamp", help="ISO-8601 timestamp override for tests.")

@@ -1,6 +1,6 @@
 ---
 name: code-project-guidance-map
-description: Create or refresh a structured AGENTS.md project action index plus a signed manifest-backed guide tree. Use when the user asks Codex to read a project, map code structure, document module ownership, clarify module dependency boundaries, initialize project guidance, refresh an AGENTS.md project guide, or keep concise project editing guidance up to date from Git changes. Ordinary invocations must run the helper `build` command so a single script-coordinated Codex builder thread owns map construction; only that builder may perform the direct macro-map, bounded-subagent, and signing workflow.
+description: Create or refresh a structured AGENTS.md project action index plus a self-hashed manifest-backed guide tree. Use when the user asks Codex to read a project, map code structure, document module ownership, clarify module dependency boundaries, initialize project guidance, refresh an AGENTS.md project guide, or keep concise project editing guidance up to date from Git changes. Ordinary invocations must run the helper `build` command so a single script-coordinated Codex builder thread owns map construction; only that builder may perform the direct macro-map, bounded-subagent, and integrity workflow.
 ---
 
 # Code Project Guidance Map
@@ -9,9 +9,9 @@ description: Create or refresh a structured AGENTS.md project action index plus 
 
 Create or refresh the `code-project-guidance-map` block in the repository root `AGENTS.md`, plus `.agents/guidance-map/manifest.json` and manifest-backed Markdown guide files under `.agents/guidance-map/guides/`.
 
-`AGENTS.md` is only the project action index. It should contain project-level metadata, global editing/routing/dependency rules, progressive-disclosure rules, and the signed manifest pointer/digest. Do not put module-internal structure, long file inventories, guide-tree internals, or deep implementation notes directly in `AGENTS.md`.
+`AGENTS.md` is only the project action index. It should contain project-level metadata, global editing/routing/dependency rules, progressive-disclosure rules, and the manifest pointer. Do not put module-internal structure, freshness cursors, long file inventories, guide-tree internals, or deep implementation notes directly in `AGENTS.md`.
 
-The guide tree contains the module-specific detail. Guide files are lazy context, not startup context: later agents should run `guidance_map.py query "<task>"` and read only the manifest-verified guide files returned for the task. Each manifest entry records guide id, parent id, path, tags, read/skip triggers, source globs, content digest, and source snapshot. `AGENTS.md` signs the manifest digest, and the manifest signs the guide digests. A guide whose content digest does not match the manifest must not be read as trusted context.
+The guide tree contains the module-specific detail. Guide files are lazy context, not startup context: later agents should run `guidance_map.py query "<task>"` and read only the verified guide files returned for the task. `AGENTS.md`, the manifest, and every guide each carry one short SHA-256-derived self-hash and are responsible only for their own content. The manifest records guide identity, routing metadata, source globs, source snapshots, and freshness cursors, but it does not sign guide content and `AGENTS.md` does not sign the manifest. These unkeyed hashes detect accidental or manual content changes; they are integrity checks, not authentication or proof of authorship.
 
 This skill must protect the main thread context and enforce a single construction owner. Ordinary Codex threads must not construct or refresh the map directly. They must hand off to `guidance_map.py build`, which creates or coordinates one Codex builder thread and exits after the builder is running or the request has been queued. If another builder is already active, the script records the new request context for that active builder; it must not start a second builder. After a successful start, queue, or Desktop attach, the caller must return to the user immediately and must not wait for, poll, read, follow, or summarize the builder thread's completion.
 
@@ -35,7 +35,7 @@ Tree guide files use these exact metadata markers:
 <!-- code-project-guidance-map:guide:end -->
 ```
 
-Do not rewrite user-authored content outside the `AGENTS.md` marker block. Do not manually edit manifest signatures or generated guide metadata; use the helper.
+Do not rewrite user-authored content outside the `AGENTS.md` marker block. Do not manually edit generated self-hashes or guide metadata; use the helper.
 
 ## Entry Mode Gate
 
@@ -89,21 +89,21 @@ The scan writes `.agents/guidance-map/project-map.json` with file-tree, language
 3. If `AGENTS.md` is missing or has no guidance block, ask the user whether to read the project and generate the guide. If the user already explicitly requested generation or refresh, treat that as consent and continue.
 
 4. If a guidance block exists:
-   - Read its `Generator version`, `Generated at` timestamp, guide format, signature key id, aggregate signature, manifest path, and manifest digest.
-   - Use the script `verify` JSON to inspect Git changes since that timestamp, including committed, staged, unstaged, and untracked files. The helper filters out local changes whose current content still matches the signed `Local change baseline` captured during the last refresh.
+   - Read its `Generator version`, guide format, short content hash, and manifest path. Read `Generated at`, `Git baseline`, and `Local change baseline` from the manifest through `status`/`verify` output.
+   - Use the script `verify` JSON to inspect Git changes since the manifest timestamp, including committed, staged, unstaged, and untracked files. The helper filters out local changes whose current content still matches the manifest `Local change baseline` captured during the last refresh.
    - If the generator version is missing, invalid, or has a different major/minor version from the current helper, perform a full refresh through the mandatory subagent workflow.
    - If only the patch version differs, keep the existing project index and module guide files as reusable unless Git changes require a scoped refresh.
-   - If the aggregate `AGENTS.md` signature is invalid, perform a full refresh.
-   - If the manifest is invalid, missing, mismatched with `AGENTS.md`, or one or more changed guide files are tampered, refresh the affected guide files and manifest.
+   - If the `AGENTS.md` self-hash is invalid, perform a full refresh.
+   - If the manifest self-hash is invalid or missing, or one or more changed guide files fail their own self-hash or manifest identity binding, refresh the affected guide files and manifest.
    - If `recommended_action` is `refresh_dependency_rules`, re-evaluate project-level `Agent Editing Rules`, `Module Dependency Rules`, and affected module index entries.
    - If `recommended_action` is `refresh_task_routing_and_affected_modules`, refresh task routing guidance and affected module guides.
    - If `recommended_action` is `refresh_affected_modules`, re-read only affected modules and refresh only their module guide files.
    - If `recommended_action` is `none`, report that the guide is current unless the user explicitly asks for a full refresh.
 
 5. Define `run_mode` before any source reading beyond shallow inspection:
-   - `no-op`: `verify.recommended_action` is `none`, the existing block, manifest, and changed guide digests are valid, and the user did not explicitly request generation or full refresh.
+   - `no-op`: `verify.recommended_action` is `none`, the existing block, manifest, and changed guide self-hashes are valid, and the user did not explicitly request generation or full refresh.
    - `generate`: `AGENTS.md` is missing or has no guidance block and the user consents or already requested generation.
-   - `full_refresh`: `verify.recommended_action` is `full_refresh`, index metadata/signature/format/version is invalid, module boundaries are no longer trustworthy, or the user explicitly requests a full refresh.
+   - `full_refresh`: `verify.recommended_action` is `full_refresh`, index metadata/self-hash/format/version is invalid, module boundaries are no longer trustworthy, or the user explicitly requests a full refresh.
    - `incremental_refresh`: `verify.recommended_action` is `refresh_dependency_rules`, `refresh_task_routing_and_affected_modules`, `refresh_affected_modules`, or `review_changed_files`.
    - `plan-only`: a safe fallback when `run_mode` would otherwise be `generate`, `full_refresh`, or `incremental_refresh`, but no subagent/delegation tool is available.
    - For `generate`, `full_refresh`, and `incremental_refresh`, module subagents are mandatory.
@@ -134,7 +134,7 @@ The scan writes `.agents/guidance-map/project-map.json` with file-tree, language
    - Give each module subagent: guide id, guide title, parent guide id if any, bounded path scope, guide output path under `.agents/guidance-map/guides/`, relevant changed files if any, and the exact guide file format.
    - Each module subagent must create or update only its assigned guide file, normally under `.agents/guidance-map/guides/<module>/<topic>.md` or `.agents/guidance-map/guides/<module>/index.md`.
    - Module subagents must not decide global module boundaries and must not edit unrelated module guide files.
-   - Module subagents may update their own guide-index entry draft or return it, but the final `AGENTS.md` and manifest write must go through the helper so signatures stay consistent.
+   - Module subagents may update their own guide-index entry draft or return it, but the final `AGENTS.md` and manifest write must go through the helper so self-hashes stay consistent.
    - Do not start another project-map builder from a module subagent.
    - If the repository is too large to represent usefully within the total module-subagent limit, prefer a coarser but complete guide tree and explicitly note the grouping tradeoff in the final summary. Do not start extra module subagents without the user explicitly increasing the limit.
 
@@ -188,17 +188,17 @@ The scan writes `.agents/guidance-map/project-map.json` with file-tree, language
 - <module-specific constraints if needed>
 ````
 
-The helper adds or replaces tree-guide metadata at the top of each file, then records the file content digest and source snapshot in the signed manifest.
+The helper adds or replaces tree-guide metadata and its short self-hash at the top of each file, then records only routing metadata and the source snapshot in the self-hashed manifest.
 
-10. Update `AGENTS.md`, write `manifest.json`, and record all guide digests with:
+10. Update the guide tree and manifest, and update `AGENTS.md` only when project structure changed, with:
 
 ```bash
 python <skill-dir>/scripts/guidance_map.py update --repo <repo-root> --guidance-file <temp-index.md>
 ```
 
-The helper creates `AGENTS.md` if needed, appends the block if missing, replaces only the marker block if present, writes guide metadata, writes `.agents/guidance-map/manifest.json`, signs the manifest, writes the manifest digest into `AGENTS.md`, and signs the aggregate `AGENTS.md` index.
+The helper creates `AGENTS.md` if needed, appends the block if missing, writes guide self-hashes, and writes a self-hashed `.agents/guidance-map/manifest.json`. On later refreshes it preserves `AGENTS.md` byte-for-byte unless the generated project-level rules, task routing, dependency rules, guide-tree topology, or manifest pointer actually changed. A stale map caused only by implementation or guide-detail changes must refresh the affected guides and manifest without rewriting `AGENTS.md`.
 
-Manifest guide entries include deterministic source snapshots for the guide source globs. When source or manifest files change, `verify` can target the affected guide without treating unrelated guides as stale. `query` must not recommend a guide whose content digest no longer matches the signed manifest.
+Manifest guide entries include deterministic source snapshots for the guide source globs. When source or manifest files change, `verify` can target the affected guide without treating unrelated guides as stale. `query` must not recommend a guide whose self-hash or manifest-bound identity is invalid.
 
 When graphify evidence is useful and `graphify-out/graph.json` exists, prefer `python <skill-dir>/scripts/guidance_map.py query "<task>" --repo <repo-root> --use-graphify` or the explicit `--run-graphify` form. Do not read `graphify-out/graph.json` directly into model context.
 
@@ -226,13 +226,9 @@ Use this shape inside the generated `AGENTS.md` block:
 ## Code Project Guidance Map
 
 Generator: code-project-guidance-map
-Generator version: 0.3.0
-Guide format: action-map:v4
-Generated at: <ISO-8601 timestamp>
-Git baseline: <HEAD sha or none>
-Local change baseline: sha256:<digest>:<encoded local-change snapshot>
-Signature key id: <repo-scoped key id>
-Signature: hmac-sha256:<64 lowercase hex chars>
+Generator version: 0.4.0
+Guide format: action-map:v5
+Content hash: sha256:<16 lowercase hex chars>
 
 ### Agent Editing Rules
 
@@ -261,7 +257,6 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 ### Guidance Manifest
 
 Guidance manifest: `.agents/guidance-map/manifest.json`
-Guidance manifest digest: `sha256:<64 lowercase hex chars>`
 ````
 
 Use this shape at the top of each guide after helper metadata is applied:
@@ -272,6 +267,7 @@ Guide ID: backend.api.controllers
 Guide kind: leaf
 Guide path: .agents/guidance-map/guides/backend/api/controllers.md
 Parent guide ID: backend.api
+Content hash: sha256:<16 lowercase hex chars>
 <!-- code-project-guidance-map:guide:end -->
 
 # <short module name>
@@ -286,22 +282,23 @@ Parent guide ID: backend.api
 ## Incremental Update Rules
 
 - Treat the script's `verify.changed_files`, `change_impact`, `affected_guides`, and `recommended_action` as the update scope.
-- Treat `Local change baseline` as the dirty-worktree freshness boundary: a file that was already dirty during the last refresh should not trigger another refresh until its content changes again.
+- Treat the manifest `Local change baseline` as the dirty-worktree freshness boundary: a file that was already dirty during the last refresh should not trigger another refresh until its content changes again.
 - In the script-coordinated builder agent, use module subagents for affected-guide rereads and guide rewrites.
 - Do not re-evaluate `Agent Editing Rules` or `Module Dependency Rules` for ordinary module-internal changes.
-- Re-evaluate project-level rules only when `change_impact.boundary_rules` is non-empty or index metadata/signature/format/version is invalid.
-- Refresh task-routing guidance when `change_impact.task_routing` is non-empty.
+- Use changed-file classifications to decide what to inspect, but modify project-level rules only when inspection confirms an actual structural or ownership-boundary change.
+- Refresh task-routing guidance only when routing ownership or flow actually changed; matching a controller/service path alone is not sufficient.
 - Map changed files back to existing manifest guide `source_globs` when possible.
 - Re-read only affected guides unless changed files indicate a project-wide restructure.
-- Preserve unchanged guide files when their content digest and source snapshot still match.
+- Preserve unchanged guide files when their self-hash and source snapshot still match.
+- Preserve `AGENTS.md` byte-for-byte for all non-structural refreshes, including affected-guide content refreshes and freshness-cursor updates.
 - Do a full refresh when:
   - `AGENTS.md` marker metadata is missing or invalid;
   - `Generator version` is missing, invalid, or has a different major/minor version from the current helper;
-  - the aggregate `AGENTS.md` signature is missing or invalid;
+  - the `AGENTS.md` self-hash is missing or invalid;
   - many directories moved or were deleted;
   - build/package manifests changed in ways that alter guide-tree or module boundaries;
   - the existing index is too stale to safely patch incrementally.
-- Do a guide-level refresh when only one or more guide content digests are invalid, missing, or affected by local source changes.
+- Do a guide-level refresh when only one or more guide self-hashes are invalid, missing, or affected by local source changes; do not rewrite `AGENTS.md` unless structure also changed.
 - After a coding task changes files and `verify.recommended_action` is `refresh_dependency_rules`, `refresh_task_routing_and_affected_modules`, or `refresh_affected_modules`, the current thread must invoke `guidance_map.py build --launcher auto` before final response so the script-coordinated builder handles the refresh. Once the request is started, queued, or handed off, finalize immediately; do not wait for builder completion. Do not refresh directly in the current thread.
 - If the script-coordinated builder cannot use subagents, it must switch to `plan-only` and report the bounded refresh plan instead of silently skipping the guidance update.
 
@@ -315,17 +312,17 @@ Parent guide ID: backend.api
 - Never exceed the module-subagent total or concurrent limits from the builder prompt. Defaults are 8 total module subagents per build pass and 3 running at the same time.
 - Never leave completed module subagents open after their result has been collected. Reuse the same agent immediately for the next module task or close it immediately.
 - If subagents are unavailable and `run_mode` is not `no-op`, the script-coordinated builder must switch to `plan-only` and output the bounded refresh plan without reading module internals or writing guidance files.
-- Treat generated manifest signatures and guide metadata blocks as plugin-owned. Manual edits invalidate signatures/digests and require a plugin refresh.
+- Treat generated self-hashes and guide metadata blocks as plugin-owned. Manual edits invalidate integrity checks and require a plugin refresh.
 - If marker structure is malformed, stop and report the issue instead of guessing.
 - Do not include secrets, credentials, or private environment details in `AGENTS.md` or module guides.
-- Do not write signing secrets into the repository. The helper stores a local key outside the target repository by default, or uses `CODE_PROJECT_GUIDANCE_MAP_SECRET` / `CODE_PROJECT_GUIDANCE_MAP_KEY_FILE` when configured.
+- Do not describe short unkeyed hashes as signatures or authentication. They detect content changes but do not establish who created the content.
 - Standardize on `AGENTS.md`; do not create or update `Agent.md`.
 
 ## Validation
 
 After updating a guide:
 
-1. Re-run `status` to confirm `has_block` is true, `signature_valid` is true, and `manifest_valid` is true.
+1. Re-run `status` to confirm `has_block` is true, `content_hash_valid` is true, and `manifest_valid` is true.
 2. Verify `AGENTS.md` still contains any pre-existing content outside the marker block.
 3. Summarize whether the run was full or incremental, which module subagents were used, how many guide files were written, and which changed files drove an incremental update.
 4. Run `build-drain` until no pending contexts remain, then run `build-finish` to release the single-builder lease.

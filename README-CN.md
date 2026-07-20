@@ -28,12 +28,12 @@ Code Project Guidance Map 是一个 Codex plugin + skill，用来把项目结构
 - 首次生成时询问用户，除非用户已经明确要求生成或刷新。
 - 由主 agent 根据浅层仓库信号决定宏观模块划分。
 - 强制使用有边界的模块 subagents 阅读模块内部，并为每个模块组写一个独立模块 guide；默认限制为每次构建最多同时运行 3 个模块 subagent、总共最多创建 8 个模块 subagent。
-- 让 `AGENTS.md` 只保存项目级索引：全局编辑规则、任务路由、依赖规则和模块链接。
+- 让 `AGENTS.md` 只保存项目级索引：全局编辑规则、任务路由、依赖规则和 manifest 指针。
 - 把模块内部结构、关键入口和局部规则保存到 `.agents/guidance-map/guides/**`。
-- 写入 `.agents/guidance-map/manifest.json`，记录 guide id、父子关系、tags、source globs、content digest 和 source snapshot。
-- 给 `AGENTS.md` 索引和 manifest 生成签名，用来检测人工修改、manifest 替换、guide 路径逃逸或 guide 内容篡改。
+- 写入 `.agents/guidance-map/manifest.json`，记录 freshness 游标、guide id、父子关系、tags、source globs 和 source snapshot。
+- `AGENTS.md`、manifest 和每个 guide 各自只保存一个短内容哈希，各自仅对自己的内容负责。它们用于发现内容变化，不用于身份认证。
 - 根据 Git 变化增量刷新受影响 guide，而不是每次全量重读项目。
-- 刷新时记录一个已签名的本地变更基线，让刷新时已经存在的 dirty worktree 文件不会在内容未变时反复触发 stale。
+- 刷新时在 manifest 中记录本地变更基线，让刷新时已经存在的 dirty worktree 文件不会在内容未变时反复触发 stale。
 - 只注册一个面向实际修改的 `Stop` hook；不在 `SessionStart` 或 `UserPromptSubmit` 注入上下文，只有 Git 可见修改导致指引 stale 时才协调 builder。
 
 `AGENTS.md` 的固定 marker 是：
@@ -43,7 +43,7 @@ Code Project Guidance Map 是一个 Codex plugin + skill，用来把项目结构
 <!-- code-project-guidance-map:end -->
 ```
 
-tree guide 文件有自己的 metadata marker；可信性来自 manifest 中的 content digest，而不是每个文件本地 HMAC：
+tree guide 文件有自己的 metadata marker 和短自哈希：
 
 ```markdown
 <!-- code-project-guidance-map:guide:start -->
@@ -51,12 +51,13 @@ Guide ID: backend.api.controllers
 Guide kind: leaf
 Guide path: .agents/guidance-map/guides/backend/api/controllers.md
 Parent guide ID: backend.api
+Content hash: sha256:<16 lowercase hex chars>
 <!-- code-project-guidance-map:guide:end -->
 ```
 
-当前生成器版本是 `0.3.0`，当前 guide 格式是 `action-map:v4`。旧的 `action-map:v3` 产物仍可被 `status/verify/query` 识别，但下一次 refresh 会统一升级为 v4 manifest-backed guide tree。版本缺失、格式非法，或 major/minor 不兼容时需要完整刷新。只有 patch 版本不同会被视为兼容。
+当前生成器版本是 `0.4.0`，当前 guide 格式是 `action-map:v5`。旧的 `action-map:v3` 和 `action-map:v4` 产物仍可被 `status/verify/query` 识别，但下一次 refresh 会统一升级为 v5 self-hashed guide tree。版本缺失、格式非法，或 major/minor 不兼容时需要完整刷新。只有 patch 版本不同会被视为兼容。
 
-本地变更的新鲜度按内容判断。`Generated at` 用来界定已提交 Git 历史；已签名的 `Local change baseline` 会记录上次刷新时已经存在的 staged、unstaged 和 untracked 文件内容。新开 Codex thread 时，同一批 dirty 文件只要内容没再变化，就不应该再次要求刷新。
+freshness 游标全部保存在 manifest。`Generated at` 用来界定已提交 Git 历史；`Local change baseline` 会记录上次刷新时已经存在的 staged、unstaged 和 untracked 文件内容。新开 Codex thread 时，同一批 dirty 文件只要内容没再变化，就不应该再次要求刷新。
 
 ## 快速启动
 
@@ -89,7 +90,7 @@ codex plugin add code-project-guidance-map@code-project-guidance-map
 安装后，在你想生成指引的项目中新开一个 Codex 线程，然后输入：
 
 ```text
-Use $code-project-guidance-map to create or refresh this repository's signed AGENTS.md project index and manifest-backed guide tree. First decide macro guide-tree boundaries from shallow repo signals, then spawn bounded module subagents to create or refresh `.agents/guidance-map/guides/**`, then use the helper to write the manifest, record guide digests/source snapshots, and sign AGENTS.md. Do not do module-internal reading in the main thread.
+Use $code-project-guidance-map to create or refresh this repository's self-hashed AGENTS.md project index and manifest-backed guide tree. First decide macro guide-tree boundaries from shallow repo signals, then spawn bounded module subagents to create or refresh `.agents/guidance-map/guides/**`, then use the helper to self-hash each artifact and record source snapshots in the manifest. Do not do module-internal reading in the main thread.
 ```
 
 构建 helper 默认使用 `guidance_map.py build --launcher auto`。`auto` 会优先通过 `codex exec` 启动 builder，因此 agent 环境里需要有可运行的 `codex` 命令，或者设置 `CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND` / `--codex-command` 指向可运行的 Codex CLI。不要假设安装 Codex Desktop 后所有用户都会自动拥有可被脚本调用的 CLI；如果没有 CLI 但当前请求运行在 Codex Desktop 中，`auto` 会返回 `desktop_manual_handoff_required`，并生成 `.handoff.md`、短 `codex://new?path=...&prompt=...` deep link、attach 命令和失败清理命令，用户可以用新的本地 Desktop thread 接力 builder。`--launcher desktop` 仅保留给确实具备 Desktop thread creation tool 的环境作为显式 handoff 路径。
@@ -105,14 +106,14 @@ python <installed-skill>\scripts\guidance_map.py benchmark-build --repo .
 python <installed-skill>\scripts\guidance_map.py compare-graphify --repo . --query "add an API controller"
 ```
 
-`scan` 会写入 `.agents/guidance-map/project-map.json`，包含文件树、语言、manifest、模块候选、import、changed files 和 graphify 可用性摘要。`query` 会基于 signed manifest 和 guide tree 推荐 guide、源码路径、测试路径，以及可选 graphify query 命令；命中的 guide 会先校验 content digest，篡改过的 guide 不会作为可信建议返回。只有显式传入 `--run-graphify` 时才会实际运行 graphify query 并截取输出。`compare-graphify` 会把 CPGM 的 project-map/tree-query metrics 和本地 graphify graph metadata 放在同一个 JSON 中。
+`scan` 会写入 `.agents/guidance-map/project-map.json`，包含文件树、语言、manifest、模块候选、import、changed files 和 graphify 可用性摘要。`query` 会基于 self-hashed manifest 和 guide tree 推荐 guide、源码路径、测试路径，以及可选 graphify query 命令；命中的 guide 会先校验自己的 content hash 及 manifest 身份绑定，校验失败的 guide 不会返回。只有显式传入 `--run-graphify` 时才会实际运行 graphify query 并截取输出。`compare-graphify` 会把 CPGM 的 project-map/tree-query metrics 和本地 graphify graph metadata 放在同一个 JSON 中。
 
 ## 如何使用
 
 首次生成：
 
 ```text
-Use $code-project-guidance-map to create this repository's signed AGENTS.md project index and per-module guide files.
+Use $code-project-guidance-map to create this repository's self-hashed AGENTS.md project index and per-module guide files.
 ```
 
 项目结构发生明显变化后刷新：
@@ -140,7 +141,7 @@ Use $code-project-guidance-map, then help me identify where this feature should 
 
 hook 是只读的，并且只注册在 `Stop`。它不会在 `SessionStart` 或 `UserPromptSubmit` 注入上下文；只有 Git 可见的项目修改让索引或 guide tree 过期、缺失或无法验签时才会提示。状态机按项目、session、action 和修改内容指纹降噪。发出提示前，hook 会调用只读的 `guidance_map.py build-status`；如果 CLI 或 Desktop builder 已经运行，就保持静默，让主线程直接结束。如果还没有 builder，则要求 Codex 调用 `guidance_map.py build --launcher auto`，并在 started、queued 或 Desktop handoff/attach 成功后立即 final，不能等待、轮询、读取或跟随 builder thread。
 
-生成和刷新必须使用 subagents，但只能在脚本协调的 builder agent 内使用。普通主线程只负责启动、排队或交接 builder，成功后立即返回，不能等待或跟随 builder 完成。模块 subagent 直接写自己负责的模块 guide 文件，并且必须限流和管理生命周期：默认同时最多运行 3 个模块 subagent，每次构建总共最多创建 8 个模块 subagent。这里的并发数应当被当成固定 worker slot。某个模块任务完成后，builder 必须先收集结果，然后要么立刻复用同一个已完成 agent 去做下一个模块，要么立刻关闭它再继续；不能把 completed agents 一直堆到构建最后统一关闭。如果仓库天然模块更多，builder 必须把相关路径合并成更粗的模块组，不能继续打开更多 terminal 或 agent pane。可通过 `CODE_PROJECT_GUIDANCE_MAP_MAX_CONCURRENT_MODULE_SUBAGENTS`、`CODE_PROJECT_GUIDANCE_MAP_MAX_TOTAL_MODULE_SUBAGENTS` 或对应的 `build` 参数调整。builder 只负责宏观模块划分和紧凑的 `AGENTS.md` 索引草稿，然后运行 helper 给模块文件签名、把模块签名回填进索引，并写入带总签名的 `AGENTS.md` 区块。如果 subagents 不可用，则进入 `plan-only`，只输出有边界的刷新计划，不读模块内部、不写指引文件。
+生成和刷新必须使用 subagents，但只能在脚本协调的 builder agent 内使用。普通主线程只负责启动、排队或交接 builder，成功后立即返回，不能等待或跟随 builder 完成。模块 subagent 直接写自己负责的模块 guide 文件，并且必须限流和管理生命周期：默认同时最多运行 3 个模块 subagent，每次构建总共最多创建 8 个模块 subagent。这里的并发数应当被当成固定 worker slot。某个模块任务完成后，builder 必须先收集结果，然后要么立刻复用同一个已完成 agent 去做下一个模块，要么立刻关闭它再继续；不能把 completed agents 一直堆到构建最后统一关闭。如果仓库天然模块更多，builder 必须把相关路径合并成更粗的模块组，不能继续打开更多 terminal 或 agent pane。可通过 `CODE_PROJECT_GUIDANCE_MAP_MAX_CONCURRENT_MODULE_SUBAGENTS`、`CODE_PROJECT_GUIDANCE_MAP_MAX_TOTAL_MODULE_SUBAGENTS` 或对应的 `build` 参数调整。builder 只负责宏观模块划分和紧凑的 `AGENTS.md` 索引草稿，然后运行 helper 为每个产物生成自哈希。非结构刷新只更新 guide 和 manifest，并保持 `AGENTS.md` 字节不变；只有项目级规则、路由、所有权或 guide tree 拓扑实际变化时才改写它。如果 subagents 不可用，则进入 `plan-only`，只输出有边界的刷新计划，不读模块内部、不写指引文件。
 
 ## 会产生什么
 
@@ -151,12 +152,9 @@ hook 是只读的，并且只注册在 `Stop`。它不会在 `SessionStart` 或 
 ## Code Project Guidance Map
 
 Generator: code-project-guidance-map
-Generator version: 0.3.0
-Guide format: action-map:v4
-Generated at: 2026-06-15T10:30:00Z
-Git baseline: abc1234
-Signature key id: repo:1a2b3c4d5e6f7890
-Signature: hmac-sha256:<64 lowercase hex chars>
+Generator version: 0.4.0
+Guide format: action-map:v5
+Content hash: sha256:<16 lowercase hex chars>
 
 ### Agent Editing Rules
 
@@ -185,16 +183,19 @@ Signature: hmac-sha256:<64 lowercase hex chars>
 ### Guidance Manifest
 
 Guidance manifest: `.agents/guidance-map/manifest.json`
-Guidance manifest digest: `sha256:<64 lowercase hex chars>`
 <!-- code-project-guidance-map:end -->
 ````
 
 对应模块文件保存细节：
 
 ````markdown
-<!-- code-project-guidance-map:module:start -->
-Signature: hmac-sha256:<64 lowercase hex chars>
-<!-- code-project-guidance-map:module:end -->
+<!-- code-project-guidance-map:guide:start -->
+Guide ID: scheduling.rules
+Guide kind: leaf
+Guide path: .agents/guidance-map/guides/scheduling/rules.md
+Parent guide ID: scheduling
+Content hash: sha256:<16 lowercase hex chars>
+<!-- code-project-guidance-map:guide:end -->
 
 # Scheduling
 
@@ -226,7 +227,7 @@ src/core/scheduling/
 - 某个行为由哪个模块负责？
 - 哪个模块 guide 需要刷新？
 - 修改前应该先读哪些目录？
-- 签名问题是影响整个索引，还是只影响某个模块 guide？
+- 哪个产物自己的 content hash 无效，而不把它的责任扩大到其他产物？
 
 ## 分发给别人使用
 
@@ -294,4 +295,4 @@ codex plugin add code-project-guidance-map@code-project-guidance-map
 
 这个项目的目标是让 Codex 从“临时读代码”走向“可复用、可验证、可增量刷新的项目记忆”。
 
-它不追求完整项目手册，而是沉淀后续 agent 最需要的模块边界、依赖方向、归属规则和紧凑导航线索，并允许签名问题被定位到单个模块 guide。
+它不追求完整项目手册，而是沉淀后续 agent 最需要的模块边界、依赖方向、归属规则和紧凑导航线索，并允许完整性问题被定位到单个产物。

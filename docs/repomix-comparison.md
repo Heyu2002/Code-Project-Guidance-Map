@@ -6,7 +6,7 @@
 
 ## 结论
 
-Repomix 更适合一次性把仓库打包成 AI-friendly 文件，安装和上手非常直接，默认还给出 token 统计和 secret scan。当前插件更适合 Codex 的长期编辑落地：`AGENTS.md` 保持很小，实际任务通过 signed manifest 查询 1-5 个 guide，避免把全仓内容塞进上下文。
+Repomix 更适合一次性把仓库打包成 AI-friendly 文件，安装和上手非常直接，默认还给出 token 统计和 secret scan。当前插件更适合 Codex 的长期编辑落地：`AGENTS.md` 保持很小，实际任务通过 self-hashed manifest 查询 1-5 个 guide，避免把全仓内容塞进上下文。
 
 本轮数据里，Repomix full 输出为 38,214-863,168 tokens，`--compress` 后仍为 31,916-750,059 tokens；当前插件 query 命中的 guide 约 756-843 估算 tokens。按任务上下文计算，Repomix full 是 CPGM selected context 的 50.5x-1040.0x，Repomix compressed 仍是 42.2x-903.7x。
 
@@ -29,7 +29,7 @@ Repomix 更适合一次性把仓库打包成 AI-friendly 文件，安装和上�
 
 | Tool | Version / command result |
 |---|---|
-| Code Project Guidance Map | `generator_version=0.3.0`, `guide_format=action-map:v4` |
+| Code Project Guidance Map | `generator_version=0.4.0`, `guide_format=action-map:v5` |
 | Codex CLI | `codex-cli 0.142.1` |
 | Repomix | `1.16.0` |
 | Node | `v24.11.1` |
@@ -98,11 +98,11 @@ CPGM selected token 是 manifest 中 guide `estimated_tokens` 的求和，Repomi
 
 | 维度 | CPGM 当前插件 | Repomix |
 |---|---|---|
-| 落地形式 | `AGENTS.md` + signed manifest + 分层 guide tree + query | 单个 AI-friendly 输出文件，支持 markdown/xml/json/plain |
+| 落地形式 | `AGENTS.md` + self-hashed manifest + 分层 guide tree + query | 单个 AI-friendly 输出文件，支持 markdown/xml/json/plain |
 | 主要优势 | 启动上下文小、按任务懒加载、可验签、可 CI freshness 检查 | 一条命令打包完整仓库，输出直接可粘贴/上传，token 统计清晰 |
 | Token 策略 | query 命中 5 个 guide，本轮约 756-843 估算 tokens | full 38k-863k tokens，compressed 31k-750k tokens |
 | 速度 | scan 很快；初始化若含 update/verify/query 慢于 Repomix pack | cached 后 full pack 约 4-5s，简单直接 |
-| 安全 | manifest digest + guide content digest；`query` 只读验证通过的 guide；`verify --full` 可检出 tamper/stale | 内置 suspicious file/security check，本轮四仓均通过；但输出文件本身没有 signed trust chain |
+| 完整性 | `AGENTS.md`、manifest、guide 各自短自哈希；`query` 只读身份与自哈希通过的 guide；`verify --full` 可检出 tamper/stale。短哈希不是身份认证 | 内置 suspicious file/security check，本轮四仓均通过；输出文件完整性依赖生成与文件管理流程 |
 | 增量 | manifest 绑定 guide source snapshot，可定位 affected guides | 通常重新 pack；本身不提供 guide 级 freshness |
 | 查询 | `guidance_map.py query "<task>"` 返回 guide/source/test 候选 | 无内建任务路由；消费侧通常要让 LLM 读/搜输出文件 |
 | 上下文风险 | guide 质量差时 query 会有噪声；完整语义依赖 Codex builder | 大仓库输出容易超过常用上下文；compressed 也可能非常大 |
