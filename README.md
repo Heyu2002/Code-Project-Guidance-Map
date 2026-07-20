@@ -114,7 +114,7 @@ After installation, open a new Codex thread in the project you want to map and i
 Use $code-project-guidance-map to refresh the self-hashed AGENTS.md guidance map via its single builder.
 ```
 
-The build helper uses `guidance_map.py build --launcher auto`. `auto` first launches through `codex exec`, using a runnable `codex` command on PATH or `CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND` / `--codex-command`. Do not assume the Codex Desktop app installs a script-callable CLI for every user. If no CLI is available but the request is running inside Codex Desktop, `auto` prepares `desktop_manual_handoff_required`: a `.handoff.md` file, a short `codex://new?path=...&prompt=...` deep link, and attach/cleanup commands so the user can open a new local Desktop thread without pasting the full builder prompt. `--launcher desktop` remains an explicit handoff path for environments where a Codex Desktop thread creation tool is available.
+The build helper uses `guidance_map.py build --launcher auto`. `auto` follows the request origin: a Codex Desktop request returns `desktop_launch_required` immediately so the caller creates and attaches a new Desktop thread, without probing a CLI command; a Codex CLI request resolves and starts `codex exec`. `--launcher desktop` and `--launcher cli` force their respective paths. Every caller finalizes immediately after start, queue, or Desktop attach and never waits for builder completion.
 
 ## Usage
 

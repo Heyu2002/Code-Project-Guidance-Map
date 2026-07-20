@@ -1,6 +1,6 @@
 {
   "name": "code-project-guidance-map",
-  "version": "0.4.0",
+  "version": "0.4.0+codex.20260720051352",
   "description": "Create self-hashed AGENTS.md project indexes and manifest-backed guide trees for Codex project editing.",
   "author": {
     "name": "Heyu2002"
@@ -16,7 +16,7 @@
   "interface": {
     "displayName": "Code Project Guidance Map",
     "shortDescription": "Create self-hashed AGENTS.md indexes and guide trees.",
-    "longDescription": "Builds and refreshes a marker-delimited AGENTS.md project index plus a self-hashed manifest-backed Markdown guide tree under .agents/guidance-map/guides. AGENTS.md stays compact with editing rules, task routing, dependency rules, a manifest pointer, and only its own short content hash; freshness cursors live in .agents/guidance-map/manifest.json, and each guide carries its own content hash. Non-structural refreshes preserve AGENTS.md byte-for-byte. Query validates selected guide identities and self-hashes before recommending them, and full verification can scan every guide. A modification-only Stop hook checks Git-visible changes without injecting startup or prompt context; it stays silent while a builder is active so the caller thread never waits for builder completion. Ordinary threads request refreshes through the helper build command; the helper enforces one active script-coordinated Codex builder thread per repository, synchronizes later request context into that builder, and prevents multiple threads from constructing the same map concurrently. CLI users are launched through `codex exec`; Desktop-only users are handed off through a Desktop-created local project thread after the helper claims the same build lease.",
+    "longDescription": "Builds and refreshes a marker-delimited AGENTS.md project index plus a self-hashed manifest-backed Markdown guide tree under .agents/guidance-map/guides. AGENTS.md stays compact with editing rules, task routing, dependency rules, a manifest pointer, and only its own short content hash; freshness cursors live in .agents/guidance-map/manifest.json, and each guide carries its own content hash. Non-structural refreshes preserve AGENTS.md byte-for-byte. Query validates selected guide identities and self-hashes before recommending them, and full verification can scan every guide. A modification-only Stop hook checks Git-visible changes without injecting startup or prompt context; it stays silent while a builder is active so the caller task never waits for builder completion. Ordinary tasks request refreshes through the helper build command; the helper enforces one active script-coordinated Codex builder task per repository and synchronizes later request context into it. Auto launcher selection follows the request origin: Desktop requests prefer a newly created Desktop task, while CLI requests prefer `codex exec`. The caller finalizes immediately after start, queue, or Desktop attach.",
     "developerName": "Heyu2002",
     "category": "Productivity",
     "capabilities": [

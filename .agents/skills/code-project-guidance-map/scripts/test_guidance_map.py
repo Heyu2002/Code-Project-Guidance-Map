@@ -1113,41 +1113,29 @@ class GuidanceMapTests(unittest.TestCase):
         command = guidance_map.resolve_codex_command(f"{sys.executable} fake_codex.py")
         self.assertEqual(command, [sys.executable, "fake_codex.py"])
 
-    def test_auto_build_uses_cli_even_in_desktop_thread(self) -> None:
+    def test_auto_build_prefers_desktop_thread_even_when_cli_is_configured(self) -> None:
         os.environ["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] = "Codex Desktop"
-        fake_codex = self.repo / "fake_codex.py"
-        fake_codex.write_text(
-            "import pathlib, sys, time\n"
-            "args = sys.argv[1:]\n"
-            "sys.stdin.read()\n"
-            "if '-o' in args:\n"
-            "    pathlib.Path(args[args.index('-o') + 1]).write_text('started\\n', encoding='utf-8')\n"
-            "time.sleep(5)\n",
-            encoding="utf-8",
-        )
 
         result = guidance_map.start_guidance_build(
             self.repo,
             reason="desktop-refresh",
             context="desktop request context",
-            codex_command=f"{sys.executable} {fake_codex}",
+            codex_command=f"{sys.executable} definitely-not-launched.py",
             launcher="auto",
         )
 
-        self.assertEqual(result["status"], "started")
-        self.assertEqual(result["launcher"], "cli")
-        pid = int(result["pid"])
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-        time.sleep(0.1)
+        self.assertEqual(result["status"], "desktop_launch_required")
+        self.assertEqual(result["launcher"], "desktop")
+        self.assertEqual(result["handoff_mode"], "thread_tool")
+        self.assertIn("desktop request context", result["prompt"])
+        attached = guidance_map.attach_desktop_builder_thread(self.repo, str(result["build_id"]), "thread-desktop-auto")
+        self.assertEqual(attached["thread_id"], "thread-desktop-auto")
         finished = guidance_map.finish_guidance_build(self.repo, str(result["build_id"]), "abandoned", force=True)
         self.assertEqual(finished["finish_status"], "abandoned")
 
-    def test_auto_build_returns_manual_desktop_handoff_when_cli_is_missing(self) -> None:
+    def test_auto_build_in_desktop_does_not_probe_cli(self) -> None:
         os.environ["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] = "Codex Desktop"
-        with mock.patch("guidance_map.shutil.which", return_value=None):
+        with mock.patch("guidance_map.resolve_codex_command", side_effect=AssertionError("CLI should not be probed")) as resolve_cli:
             result = guidance_map.start_guidance_build(
                 self.repo,
                 reason="desktop-refresh",
@@ -1155,15 +1143,16 @@ class GuidanceMapTests(unittest.TestCase):
                 launcher="auto",
             )
 
-        self.assertEqual(result["status"], "desktop_manual_handoff_required")
+        resolve_cli.assert_not_called()
+        self.assertEqual(result["status"], "desktop_launch_required")
         self.assertEqual(result["launcher"], "desktop")
-        self.assertEqual(result["handoff_mode"], "manual")
-        self.assertIsNone(result["prompt"])
+        self.assertEqual(result["handoff_mode"], "thread_tool")
+        self.assertIsNotNone(result["prompt"])
         self.assertTrue(Path(str(result["prompt_file"])).exists())
         handoff_file = Path(str(result["handoff_file"]))
         self.assertTrue(handoff_file.exists())
         handoff_text = handoff_file.read_text(encoding="utf-8")
-        self.assertIn("desktop-manual-", result["attach_command"])
+        self.assertIn("<created-thread-id>", result["attach_command"])
         self.assertIn("Read and execute", result["handoff_prompt"])
         self.assertIn("codex://new?", result["desktop_deep_link"])
         self.assertIn("desktop request context", Path(str(result["prompt_file"])).read_text(encoding="utf-8"))
@@ -1172,11 +1161,22 @@ class GuidanceMapTests(unittest.TestCase):
         attached = guidance_map.attach_desktop_builder_thread(
             self.repo,
             str(result["build_id"]),
-            f"desktop-manual-{str(result['build_id'])[:12]}",
+            "thread-desktop-no-cli",
         )
         self.assertEqual(attached["status"], "attached")
         finished = guidance_map.finish_guidance_build(self.repo, str(result["build_id"]), "abandoned", force=True)
         self.assertEqual(finished["finish_status"], "abandoned")
+
+    def test_auto_build_from_cli_prefers_cli_launcher(self) -> None:
+        os.environ["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] = "Codex CLI"
+
+        with mock.patch("guidance_map.resolve_codex_command", return_value=[sys.executable, "fake_codex.py"]) as resolve_cli:
+            launcher, command, note = guidance_map.resolve_build_launcher("auto", None)
+
+        resolve_cli.assert_called_once_with(None)
+        self.assertEqual(launcher, "cli")
+        self.assertEqual(command, [sys.executable, "fake_codex.py"])
+        self.assertIsNone(note)
 
     def test_explicit_desktop_launcher_returns_handoff_prompt(self) -> None:
         os.environ["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] = "Codex Desktop"

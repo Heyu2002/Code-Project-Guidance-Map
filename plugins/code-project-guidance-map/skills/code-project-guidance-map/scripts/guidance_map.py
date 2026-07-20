@@ -1400,18 +1400,15 @@ def desktop_launcher_available() -> bool:
 
 def resolve_build_launcher(launcher: str | None, codex_command: str | None) -> tuple[str, list[str] | None, str | None]:
     launcher_value = normalize_build_launcher(launcher)
-    explicit_command = bool(codex_command or os.environ.get(BUILD_CODEX_COMMAND_ENV))
     if launcher_value == "desktop":
         if not desktop_launcher_available():
             return "desktop", None, "Desktop launcher was requested; create_thread must be available in the current Codex app thread."
         return "desktop", None, None
 
-    try:
-        return "cli", resolve_codex_command(codex_command), None
-    except GuidanceMapError as exc:
-        if launcher_value == "auto" and not explicit_command and desktop_launcher_available():
-            return "desktop_manual", None, str(exc)
-        raise
+    if launcher_value == "auto" and desktop_launcher_available():
+        return "desktop", None, None
+
+    return "cli", resolve_codex_command(codex_command), None
 
 
 def windows_command_is_batch_wrapper(command: list[str]) -> bool:
@@ -4591,8 +4588,8 @@ def main() -> int:
         choices=("auto", "cli", "desktop"),
         default=None,
         help=(
-            "Builder launcher. auto uses a runnable Codex CLI when available, then falls back to Desktop manual "
-            "handoff inside Codex Desktop; desktop is an explicit thread-tool handoff path."
+            "Builder launcher. auto prefers a Desktop-created thread when requested from Codex Desktop and "
+            "prefers codex exec when requested from CLI; desktop and cli force their respective paths."
         ),
     )
     build_parser.add_argument("--model", help="Optional model passed through to `codex exec`.")

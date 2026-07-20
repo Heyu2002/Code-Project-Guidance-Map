@@ -271,7 +271,7 @@ flowchart LR
 - 增加 startup health check：CLI builder 启动后必须在配置窗口内写出 JSONL 或 last-message，否则尽早失败并给出诊断，避免日志 0 bytes 的静默 lease。
 - 增加 `*.metrics.json`：记录 launcher、handoff mode、startup health、刷新范围摘要、finish status 和耗时，后续可继续沉淀同维度 benchmark。
 - 在 `verify` 默认忽略常见工具产物，如 `graphify-out/`、`.pytest_cache/`、`node_modules/`、build/coverage/bytecode 等，并把它们报告到 `changed_files_by_source.tool_ignored`。
-- 明确 Desktop-only manual handoff：无 CLI 的 Codex Desktop 用户会收到 `.handoff.md`、短 `codex://new` deep link、attach/cleanup 命令，而不是被要求在当前线程直接生成。
+- `--launcher auto` 按申请来源分流：Desktop 请求优先创建并 attach 新 Desktop task，CLI 请求优先调用 `codex exec`；调用方完成 handoff 后立即结束，不等待 builder。
 - 增加 deterministic `scan`：写入 `.agents/guidance-map/project-map.json`，包含语言、manifest、模块候选、import、changed files 和 graphify 可用性摘要。
 - 增加 `query`：基于 `AGENTS.md`/Module Index 推荐 module guide、源码路径、测试路径、边界规则，并可给出 graphify query 命令；`--run-graphify` 可显式运行 graphify query 并截取输出。
 - 增加 `benchmark-build`：默认不启动 builder，输出 project-map、guidance 体积、刷新范围、graphify 可用性和最新 builder metrics。

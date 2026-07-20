@@ -43,7 +43,7 @@ This project follows semantic versioning for the guidance generator version. Pat
 - Changed `benchmark-build` and `compare-graphify` to report manifest bytes, guide counts, parent/leaf counts, average guide size, file-query latency, selected guide context size, and graphify query output metrics.
 - Updated skill instructions, hook messages, README copy, CI docs, and plugin metadata so ordinary threads always route map construction through the single builder instead of building directly.
 - Shortened the plugin default prompt so Codex Desktop accepts it.
-- Changed `--launcher auto` to prefer a runnable CLI, then fall back to Desktop-only manual handoff inside Codex Desktop instead of assuming Desktop can always create a background thread or exposes a script-callable CLI. Users can still request the thread-tool Desktop handoff explicitly with `--launcher desktop`.
+- Changed `--launcher auto` to follow the request origin: Desktop requests prefer a new Desktop thread without probing CLI, while CLI requests prefer `codex exec`. Explicit `--launcher desktop|cli` still overrides auto selection, and callers still finalize immediately after handoff instead of waiting for the builder.
 - Changed Windows builder launches to request hidden process startup where supported, reducing visible terminal noise for CLI-backed builds.
 - Changed `verify` to ignore common generated tool/build/cache outputs such as `graphify-out/`, `node_modules/`, build directories, coverage, and bytecode while still reporting them under `changed_files_by_source.tool_ignored`.
 

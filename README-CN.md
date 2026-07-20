@@ -93,7 +93,7 @@ codex plugin add code-project-guidance-map@code-project-guidance-map
 Use $code-project-guidance-map to create or refresh this repository's self-hashed AGENTS.md project index and manifest-backed guide tree. First decide macro guide-tree boundaries from shallow repo signals, then spawn bounded module subagents to create or refresh `.agents/guidance-map/guides/**`, then use the helper to self-hash each artifact and record source snapshots in the manifest. Do not do module-internal reading in the main thread.
 ```
 
-构建 helper 默认使用 `guidance_map.py build --launcher auto`。`auto` 会优先通过 `codex exec` 启动 builder，因此 agent 环境里需要有可运行的 `codex` 命令，或者设置 `CODE_PROJECT_GUIDANCE_MAP_CODEX_COMMAND` / `--codex-command` 指向可运行的 Codex CLI。不要假设安装 Codex Desktop 后所有用户都会自动拥有可被脚本调用的 CLI；如果没有 CLI 但当前请求运行在 Codex Desktop 中，`auto` 会返回 `desktop_manual_handoff_required`，并生成 `.handoff.md`、短 `codex://new?path=...&prompt=...` deep link、attach 命令和失败清理命令，用户可以用新的本地 Desktop thread 接力 builder。`--launcher desktop` 仅保留给确实具备 Desktop thread creation tool 的环境作为显式 handoff 路径。
+构建 helper 默认使用 `guidance_map.py build --launcher auto`。`auto` 按申请来源选择：Codex Desktop 发起时不探测 CLI，直接返回 `desktop_launch_required`，由当前任务创建并 attach 一个新的 Desktop task；Codex CLI 发起时解析并调用 `codex exec`。`--launcher desktop` 和 `--launcher cli` 可以显式覆盖自动选择。无论使用哪条路径，调用方在 started、queued 或 Desktop attach 后都必须立即结束，不能等待 builder 完成。
 
 每次 build 都会在项目 build state 的 `logs/` 目录下写入 `*.prompt.md`、`*.jsonl`、`*.last-message.md` 和 `*.metrics.json`；Desktop handoff 还会写入 `*.handoff.md`。CLI builder 启动后会等待 JSONL 或 last-message 启动信号，如果进程存活但一直没有任何输出，会尽早报错而不是留下一个静默 lease。`verify` 默认忽略 `graphify-out/`、`node_modules/`、缓存、build 目录、coverage 和编译产物，这些路径会出现在 `changed_files_by_source.tool_ignored` 中，但不会让 guidance 变 stale。
 
@@ -139,7 +139,7 @@ Use $code-project-guidance-map, then help me identify where this feature should 
 - Usually skip when: Only changing helper signing, README copy, or plugin marketplace metadata.
 ```
 
-hook 是只读的，并且只注册在 `Stop`。它不会在 `SessionStart` 或 `UserPromptSubmit` 注入上下文；只有 Git 可见的项目修改让索引或 guide tree 过期、缺失或无法验签时才会提示。状态机按项目、session、action 和修改内容指纹降噪。发出提示前，hook 会调用只读的 `guidance_map.py build-status`；如果 CLI 或 Desktop builder 已经运行，就保持静默，让主线程直接结束。如果还没有 builder，则要求 Codex 调用 `guidance_map.py build --launcher auto`，并在 started、queued 或 Desktop handoff/attach 成功后立即 final，不能等待、轮询、读取或跟随 builder thread。
+hook 是只读的，并且只注册在 `Stop`。它不会在 `SessionStart` 或 `UserPromptSubmit` 注入上下文；只有 Git 可见的项目修改让索引或 guide tree 过期、缺失或无法校验时才会提示。状态机按项目、session、action 和修改内容指纹降噪。发出提示前，hook 会调用只读的 `guidance_map.py build-status`；如果 CLI 或 Desktop builder 已经运行，就保持静默，让主线程直接结束。如果还没有 builder，则要求 Codex 调用 `guidance_map.py build --launcher auto`：Desktop 发起时优先创建并 attach 新 Desktop thread，CLI 发起时优先调用 `codex exec`。started、queued 或 Desktop attach 成功后必须立即 final，不能等待、轮询、读取或跟随 builder thread。
 
 生成和刷新必须使用 subagents，但只能在脚本协调的 builder agent 内使用。普通主线程只负责启动、排队或交接 builder，成功后立即返回，不能等待或跟随 builder 完成。模块 subagent 直接写自己负责的模块 guide 文件，并且必须限流和管理生命周期：默认同时最多运行 3 个模块 subagent，每次构建总共最多创建 8 个模块 subagent。这里的并发数应当被当成固定 worker slot。某个模块任务完成后，builder 必须先收集结果，然后要么立刻复用同一个已完成 agent 去做下一个模块，要么立刻关闭它再继续；不能把 completed agents 一直堆到构建最后统一关闭。如果仓库天然模块更多，builder 必须把相关路径合并成更粗的模块组，不能继续打开更多 terminal 或 agent pane。可通过 `CODE_PROJECT_GUIDANCE_MAP_MAX_CONCURRENT_MODULE_SUBAGENTS`、`CODE_PROJECT_GUIDANCE_MAP_MAX_TOTAL_MODULE_SUBAGENTS` 或对应的 `build` 参数调整。builder 只负责宏观模块划分和紧凑的 `AGENTS.md` 索引草稿，然后运行 helper 为每个产物生成自哈希。非结构刷新只更新 guide 和 manifest，并保持 `AGENTS.md` 字节不变；只有项目级规则、路由、所有权或 guide tree 拓扑实际变化时才改写它。如果 subagents 不可用，则进入 `plan-only`，只输出有边界的刷新计划，不读模块内部、不写指引文件。
 
