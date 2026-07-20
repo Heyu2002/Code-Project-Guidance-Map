@@ -641,6 +641,38 @@ class GuidanceMapTests(unittest.TestCase):
         with self.assertRaises(guidance_map.GuidanceMapError):
             guidance_map.find_block(text)
 
+    def test_build_status_reports_idle_without_active_builder(self) -> None:
+        result = guidance_map.guidance_build_status(self.repo)
+
+        self.assertEqual(result["status"], "idle")
+        self.assertFalse(result["active"])
+        self.assertIsNone(result["active_build_id"])
+
+    def test_build_status_reports_active_desktop_builder_without_waiting(self) -> None:
+        root, git_available = guidance_map.repo_root(self.repo)
+        state_dir = guidance_map.build_state_dir(root, git_available)
+        active = {
+            "build_id": "active-build",
+            "repo_root": str(root),
+            "project_id": guidance_map.project_id(root, git_available),
+            "status": "running",
+            "launcher": "desktop",
+            "thread_id": "thread-123",
+            "started_at": guidance_map.utc_now(),
+            "pid": None,
+        }
+        state = guidance_map.read_build_state(state_dir, root, git_available)
+        state["active"] = active
+        guidance_map.write_active_lock(state_dir, active)
+        guidance_map.write_build_state(state_dir, state)
+
+        result = guidance_map.guidance_build_status(self.repo)
+
+        self.assertEqual(result["status"], "active")
+        self.assertTrue(result["active"])
+        self.assertEqual(result["active_build_id"], "active-build")
+        self.assertEqual(result["thread_id"], "thread-123")
+
     def test_build_queues_context_when_builder_is_active(self) -> None:
         root, git_available = guidance_map.repo_root(self.repo)
         state_dir = guidance_map.build_state_dir(root, git_available)

@@ -34,7 +34,7 @@ Code Project Guidance Map 是一个 Codex plugin + skill，用来把项目结构
 - 给 `AGENTS.md` 索引和 manifest 生成签名，用来检测人工修改、manifest 替换、guide 路径逃逸或 guide 内容篡改。
 - 根据 Git 变化增量刷新受影响 guide，而不是每次全量重读项目。
 - 刷新时记录一个已签名的本地变更基线，让刷新时已经存在的 dirty worktree 文件不会在内容未变时反复触发 stale。
-- 通过轻量 hooks 在 `SessionStart`、`UserPromptSubmit` 和 `Stop` 时检查指引是否缺失、过期或无法验签。
+- 只注册一个面向实际修改的 `Stop` hook；不在 `SessionStart` 或 `UserPromptSubmit` 注入上下文，只有 Git 可见修改导致指引 stale 时才协调 builder。
 
 `AGENTS.md` 的固定 marker 是：
 
@@ -138,9 +138,9 @@ Use $code-project-guidance-map, then help me identify where this feature should 
 - Usually skip when: Only changing helper signing, README copy, or plugin marketplace metadata.
 ```
 
-hooks 是只读的。它们会验证当前仓库的 `AGENTS.md` 索引和模块 guide 签名，并在缺失、过期或无法验签时给 Codex 注入有边界的上下文。hook 消息由状态机降噪：状态保存在用户的 Codex home 下，但判断粒度是项目和 session。默认同一个项目、同一个 session、同一个 action 只提示一次。发生过代码编辑类 prompt 后，`Stop` 会发出 continuation system message，要求 Codex 在 final 前立即刷新受影响指引，而不是把刷新留作下一次任务的提醒。hooks 不会自己编辑文件。
+hook 是只读的，并且只注册在 `Stop`。它不会在 `SessionStart` 或 `UserPromptSubmit` 注入上下文；只有 Git 可见的项目修改让索引或 guide tree 过期、缺失或无法验签时才会提示。状态机按项目、session、action 和修改内容指纹降噪。发出提示前，hook 会调用只读的 `guidance_map.py build-status`；如果 CLI 或 Desktop builder 已经运行，就保持静默，让主线程直接结束。如果还没有 builder，则要求 Codex 调用 `guidance_map.py build --launcher auto`，并在 started、queued 或 Desktop handoff/attach 成功后立即 final，不能等待、轮询、读取或跟随 builder thread。
 
-生成和刷新必须使用 subagents，但只能在脚本协调的 builder agent 内使用。模块 subagent 直接写自己负责的模块 guide 文件，并且必须限流和管理生命周期：默认同时最多运行 3 个模块 subagent，每次构建总共最多创建 8 个模块 subagent。这里的并发数应当被当成固定 worker slot。某个模块任务完成后，builder 必须先收集结果，然后要么立刻复用同一个已完成 agent 去做下一个模块，要么立刻关闭它再继续；不能把 completed agents 一直堆到构建最后统一关闭。如果仓库天然模块更多，builder 必须把相关路径合并成更粗的模块组，不能继续打开更多 terminal 或 agent pane。可通过 `CODE_PROJECT_GUIDANCE_MAP_MAX_CONCURRENT_MODULE_SUBAGENTS`、`CODE_PROJECT_GUIDANCE_MAP_MAX_TOTAL_MODULE_SUBAGENTS` 或对应的 `build` 参数调整。主 agent 只负责宏观模块划分和紧凑的 `AGENTS.md` 索引草稿，然后运行 helper 给模块文件签名、把模块签名回填进索引，并写入带总签名的 `AGENTS.md` 区块。如果编码改动让指引过期，Codex 应该在 final 前立即刷新受影响模块；如果 subagents 不可用，则进入 `plan-only`，只输出有边界的刷新计划，不读模块内部、不写指引文件。
+生成和刷新必须使用 subagents，但只能在脚本协调的 builder agent 内使用。普通主线程只负责启动、排队或交接 builder，成功后立即返回，不能等待或跟随 builder 完成。模块 subagent 直接写自己负责的模块 guide 文件，并且必须限流和管理生命周期：默认同时最多运行 3 个模块 subagent，每次构建总共最多创建 8 个模块 subagent。这里的并发数应当被当成固定 worker slot。某个模块任务完成后，builder 必须先收集结果，然后要么立刻复用同一个已完成 agent 去做下一个模块，要么立刻关闭它再继续；不能把 completed agents 一直堆到构建最后统一关闭。如果仓库天然模块更多，builder 必须把相关路径合并成更粗的模块组，不能继续打开更多 terminal 或 agent pane。可通过 `CODE_PROJECT_GUIDANCE_MAP_MAX_CONCURRENT_MODULE_SUBAGENTS`、`CODE_PROJECT_GUIDANCE_MAP_MAX_TOTAL_MODULE_SUBAGENTS` 或对应的 `build` 参数调整。builder 只负责宏观模块划分和紧凑的 `AGENTS.md` 索引草稿，然后运行 helper 给模块文件签名、把模块签名回填进索引，并写入带总签名的 `AGENTS.md` 区块。如果 subagents 不可用，则进入 `plan-only`，只输出有边界的刷新计划，不读模块内部、不写指引文件。
 
 ## 会产生什么
 

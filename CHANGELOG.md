@@ -30,6 +30,8 @@ This project follows semantic versioning for the guidance generator version. Pat
 
 ### Changed
 
+- Replaced the `SessionStart` and `UserPromptSubmit` hooks with a modification-only `Stop` hook driven by Git-visible changes.
+- Added read-only builder status checks so an active CLI or Desktop builder suppresses Stop continuation; caller threads now finalize immediately after start, queue, or handoff instead of waiting for builder completion.
 - Changed fresh `update` output from v3 flat module guides to v4 `AGENTS.md` + signed manifest + mixed-depth guide tree. Legacy v3 blocks remain inspectable/queryable, and refresh rewrites them into v4.
 - Changed `AGENTS.md` to store a compact manifest pointer/digest instead of every module guide signature, reducing startup context and signature churn.
 - Changed `benchmark-build` and `compare-graphify` to report manifest bytes, guide counts, parent/leaf counts, average guide size, file-query latency, selected guide context size, and graphify query output metrics.

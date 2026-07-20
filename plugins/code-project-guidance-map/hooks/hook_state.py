@@ -23,11 +23,13 @@ class HookEvent:
     event_name: str
     project_id: str
     session_id: str
-    prompt_is_code_edit: bool
     severity: str
     recommended_action: str
     stale: bool
     has_error: bool
+    has_changes: bool
+    change_fingerprint: str
+    build_active: bool
 
 
 @dataclass(frozen=True)
@@ -121,7 +123,10 @@ def stable_token(value: str) -> str:
 
 def action_key(event: HookEvent) -> str:
     action = "verify_error" if event.has_error else event.recommended_action or "none"
-    return f"{stable_token(event.severity)}:{stable_token(action)}"
+    return (
+        f"{stable_token(event.severity)}:{stable_token(action)}:"
+        f"{stable_token(event.change_fingerprint)}"
+    )
 
 
 def event_is_relevant(event: HookEvent, level: str) -> bool:
@@ -141,40 +146,27 @@ def session_state(state: dict[str, Any], project_id: str, session_id: str) -> di
     session = sessions.setdefault(
         session_id,
         {
-            "notified_actions": [],
             "stop_notified_actions": [],
-            "saw_code_edit_prompt": False,
         },
     )
-    session.setdefault("notified_actions", [])
     session.setdefault("stop_notified_actions", [])
-    session.setdefault("saw_code_edit_prompt", False)
     return session
 
 
 def transition(state: dict[str, Any], event: HookEvent, level: str) -> HookDecision:
     next_state = copy.deepcopy(state)
     session = session_state(next_state, event.project_id, event.session_id)
-    if event.prompt_is_code_edit:
-        session["saw_code_edit_prompt"] = True
 
     normalized_level = normalize_hook_level(level)
     include_info = normalized_level == "all"
+    if event.event_name != "Stop" or not event.has_changes or event.build_active:
+        return HookDecision(False, include_info, next_state)
     if not event_is_relevant(event, normalized_level):
         return HookDecision(False, include_info, next_state)
 
     key = action_key(event)
-    if event.event_name == "Stop":
-        if not session.get("saw_code_edit_prompt"):
-            return HookDecision(False, include_info, next_state)
-        stop_notified = session.setdefault("stop_notified_actions", [])
-        if key in stop_notified:
-            return HookDecision(False, include_info, next_state)
-        stop_notified.append(key)
-        return HookDecision(True, include_info, next_state)
-
-    notified = session.setdefault("notified_actions", [])
-    if key in notified:
+    stop_notified = session.setdefault("stop_notified_actions", [])
+    if key in stop_notified:
         return HookDecision(False, include_info, next_state)
-    notified.append(key)
+    stop_notified.append(key)
     return HookDecision(True, include_info, next_state)

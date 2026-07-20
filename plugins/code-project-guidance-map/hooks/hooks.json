@@ -1,32 +1,5 @@
 {
   "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "^(startup|resume|clear|compact)$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ${PLUGIN_ROOT}/hooks/guidance_map_hook.py",
-            "commandWindows": "python ${PLUGIN_ROOT}\\hooks\\guidance_map_hook.py",
-            "timeout": 10,
-            "statusMessage": "Checking AGENTS.md guidance map"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ${PLUGIN_ROOT}/hooks/guidance_map_hook.py",
-            "commandWindows": "python ${PLUGIN_ROOT}\\hooks\\guidance_map_hook.py",
-            "timeout": 10,
-            "statusMessage": "Checking AGENTS.md guidance map"
-          }
-        ]
-      }
-    ],
     "Stop": [
       {
         "hooks": [

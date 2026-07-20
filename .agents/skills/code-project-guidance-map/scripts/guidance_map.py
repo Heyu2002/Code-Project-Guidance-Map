@@ -1880,6 +1880,29 @@ def start_guidance_build(
         }
 
 
+def guidance_build_status(repo_arg: Path) -> dict[str, Any]:
+    """Return the current builder lease without waiting for builder completion."""
+    root, git_available = repo_root(repo_arg)
+    state_dir = build_state_dir(root, git_available)
+    state = read_build_state(state_dir, root, git_available)
+    active = state.get("active")
+    if not isinstance(active, dict):
+        active = read_active_lock(state_dir)
+    live = active_build_is_live(active)
+    active_payload = active if isinstance(active, dict) else {}
+    return {
+        "status": "active" if live else "idle",
+        "active": live,
+        "repo_root": str(root),
+        "project_id": project_id(root, git_available),
+        "active_build_id": active_payload.get("build_id") if live else None,
+        "active_status": active_payload.get("status") if live else None,
+        "launcher": active_payload.get("launcher") if live else None,
+        "thread_id": active_payload.get("thread_id") if live else None,
+        "state_file": str(build_state_path(state_dir)),
+    }
+
+
 def attach_desktop_builder_thread(repo_arg: Path, build_id: str, thread_id: str) -> dict[str, Any]:
     root, git_available = repo_root(repo_arg)
     state_dir = build_state_dir(root, git_available)
@@ -4408,6 +4431,12 @@ def main() -> int:
     attach_parser.add_argument("--build-id", required=True, help="Active build id.")
     attach_parser.add_argument("--thread-id", required=True, help="Created Codex Desktop thread id.")
 
+    build_status_parser = subparsers.add_parser(
+        "build-status",
+        help="Report whether a guidance-map builder is active without waiting for it.",
+    )
+    build_status_parser.add_argument("--repo", default=".", help="Repository or project directory.")
+
     drain_parser = subparsers.add_parser("build-drain", help="Drain pending build contexts for the active builder.")
     drain_parser.add_argument("--repo", default=".", help="Repository or project directory.")
     drain_parser.add_argument("--build-id", required=True, help="Active build id.")
@@ -4468,6 +4497,8 @@ def main() -> int:
             )
         elif args.command == "build-attach":
             output = attach_desktop_builder_thread(Path(args.repo), args.build_id, args.thread_id)
+        elif args.command == "build-status":
+            output = guidance_build_status(Path(args.repo))
         elif args.command == "build-drain":
             output = drain_build_context(Path(args.repo), args.build_id)
         elif args.command == "benchmark-build":

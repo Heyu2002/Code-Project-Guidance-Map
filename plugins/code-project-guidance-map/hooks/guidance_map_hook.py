@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Codex hooks for code-project-guidance-map.
+"""Modification-only Stop hook for code-project-guidance-map.
 
-The hooks are intentionally read-only. They verify the generated AGENTS.md index
-and signed module guides, then add bounded model context when guidance is stale
-or unverifiable.
+The hook is intentionally read-only. It verifies guidance after Git-visible project
+changes and requests an asynchronous refresh only when no builder is already active.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -21,21 +20,6 @@ import hook_state
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 GUIDANCE_MAP = PLUGIN_ROOT / "skills" / "code-project-guidance-map" / "scripts" / "guidance_map.py"
 
-ACTION_PATTERNS = (
-    r"\b(add|change|modify|edit|implement|fix|refactor|update|delete|remove|write|create)\b",
-    r"(\u65b0\u589e|\u4fee\u6539|\u5b9e\u73b0|\u4fee\u590d|\u91cd\u6784|\u66f4\u65b0|\u5220\u9664|\u521b\u5efa|\u8c03\u6574|\u6539\u4e00\u4e2a|\u5199\u4e00\u4e2a)",
-)
-
-CODE_CONTEXT_PATTERNS = (
-    r"\b(api|endpoint|controller|service|dao|repository|mapper|sql|schema|migration|test|bug|feature)\b",
-    r"(\u63a5\u53e3|\u63a7\u5236\u5668|\u670d\u52a1|\u6570\u636e\u5e93|\u6301\u4e45\u5316|\u6a21\u5757|\u529f\u80fd|\u4ee3\u7801|\u6d4b\u8bd5|\u62a5\u9519|\u95ee\u9898|\u7f3a\u9677|\u903b\u8f91)",
-)
-
-DIRECT_CODE_PATTERNS = (
-    r"\b(src|app|lib|packages|modules|web|server|client|frontend|backend)/",
-    r"\.(py|js|jsx|ts|tsx|java|kt|go|rs|cs|php|rb|sql|xml|yaml|yml|toml|json)\b",
-)
-
 
 def read_input() -> dict[str, Any]:
     try:
@@ -45,34 +29,10 @@ def read_input() -> dict[str, Any]:
         return {}
 
 
-def hook_output(event_name: str, additional_context: str | None) -> None:
+def hook_output(additional_context: str | None) -> None:
     if not additional_context:
         return
-    if event_name == "Stop":
-        print(json.dumps({"systemMessage": additional_context}, ensure_ascii=False))
-        return
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": event_name,
-                    "additionalContext": additional_context,
-                }
-            },
-            ensure_ascii=False,
-        )
-    )
-
-
-def pattern_matches(patterns: tuple[str, ...], text: str) -> bool:
-    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
-
-
-def prompt_looks_like_code_edit(prompt: str) -> bool:
-    lowered = prompt.casefold()
-    if pattern_matches(DIRECT_CODE_PATTERNS, lowered):
-        return True
-    return pattern_matches(ACTION_PATTERNS, lowered) and pattern_matches(CODE_CONTEXT_PATTERNS, lowered)
+    print(json.dumps({"systemMessage": additional_context}, ensure_ascii=False))
 
 
 def verify_repo(cwd: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -95,6 +55,38 @@ def verify_repo(cwd: str) -> tuple[dict[str, Any] | None, str | None]:
     return parsed, None
 
 
+def active_build(cwd: str) -> bool:
+    result = subprocess.run(
+        [sys.executable, str(GUIDANCE_MAP), "build-status", "--repo", cwd],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    return bool(parsed.get("active"))
+
+
+def modification_fingerprint(repo: str, changed_files: list[str]) -> str:
+    root = Path(repo).resolve()
+    digest = hashlib.sha256()
+    for relative in sorted(changed_files):
+        digest.update(relative.encode("utf-8", errors="replace"))
+        path = (root / relative).resolve()
+        try:
+            path.relative_to(root)
+            content = path.read_bytes() if path.is_file() else b"<missing>"
+        except (OSError, ValueError):
+            content = b"<unreadable>"
+        digest.update(hashlib.sha256(content).digest())
+    return digest.hexdigest()
+
+
 def actionable_change_summary(verification: dict[str, Any]) -> str:
     action = verification.get("recommended_action") or "review"
     reasons = verification.get("reasons") or []
@@ -115,7 +107,6 @@ def actionable_change_summary(verification: dict[str, Any]) -> str:
 
 
 def context_for(
-    event_name: str,
     verification: dict[str, Any] | None,
     error: str | None,
     include_info: bool = False,
@@ -125,11 +116,10 @@ def context_for(
     build_command = f"python {GUIDANCE_MAP} build --repo {repo_arg} --launcher auto --context <current-request-summary>"
     if error:
         return (
-            "Code Project Guidance Map hook: AGENTS.md action map could not be verified. "
-            f"{error}. Before the next code edit, run the helper build command so a single script-coordinated builder agent "
-            f"refreshes the signed project index: `{build_command}`. In Codex Desktop, if the helper returns "
-            "`desktop_launch_required`, create the Desktop builder thread from the returned prompt and attach it. "
-            "Do not build the map directly in this thread."
+            "Code Project Guidance Map modification hook: project files changed, but the signed guidance map could not be "
+            f"verified. {error}. Start or synchronize the dedicated builder with `{build_command}`. Once the command returns "
+            "`started` or `queued`, or once a Desktop builder thread is created and attached, finalize this thread immediately. "
+            "Do not wait for, poll, read, or follow the builder thread's completion."
         )
     if not verification:
         return None
@@ -141,65 +131,46 @@ def context_for(
         return None
 
     summary = actionable_change_summary(verification)
-    if event_name == "UserPromptSubmit":
-        return (
-            "Code Project Guidance Map hook: this looks like a code-edit request, and the repository "
-            f"AGENTS.md project index or module guides are stale or unverifiable. {summary} Before editing code, run "
-            f"the helper build command so the single script-coordinated builder agent refreshes the signed project index "
-            f"and affected module guide files: `{build_command}`. If another builder is active, the helper will synchronize "
-            "this thread's context instead of starting a second builder. In Codex Desktop, handle `desktop_launch_required` "
-            "by creating the returned-prompt builder thread and attaching it."
-        )
-    if event_name == "Stop":
-        return (
-            "Code Project Guidance Map hook: continue this task before finalizing because the repository AGENTS.md project index "
-            f"or module guides are stale, missing, or unverifiable. {summary} Run the helper build command now so the single "
-            f"script-coordinated builder agent refreshes the signed project index and affected module guide files: `{build_command}`. "
-            "If another builder is active, the helper will queue this context for the active builder. In Codex Desktop, handle "
-            "`desktop_launch_required` by creating the returned-prompt builder thread and attaching it."
-        )
     return (
-        "Code Project Guidance Map hook: this repository's AGENTS.md project index or module guides are stale, missing, "
-        f"or unverifiable. {summary} Before the first code edit in this thread, suggest running the helper build command "
-        "so a single script-coordinated builder agent owns the refresh."
+        "Code Project Guidance Map modification hook: project changes made the repository AGENTS.md project index or guide "
+        f"tree stale or unverifiable. {summary} Start or synchronize the dedicated builder with `{build_command}`. Once the "
+        "command returns `started` or `queued`, or once a Desktop builder thread is created and attached, finalize this thread "
+        "immediately. Do not wait for, poll, read, or follow the builder thread's completion."
     )
 
 
 def main() -> int:
     payload = read_input()
     event_name = payload.get("hook_event_name")
-    if event_name not in {"SessionStart", "UserPromptSubmit", "Stop"}:
+    if event_name != "Stop":
         return 0
-
-    prompt = str(payload.get("prompt") or "")
-    prompt_is_code_edit = False
-    if event_name == "UserPromptSubmit":
-        if "$code-project-guidance-map" in prompt or "code-project-guidance-map" in prompt:
-            return 0
-        prompt_is_code_edit = prompt_looks_like_code_edit(prompt)
-        if not prompt_is_code_edit:
-            return 0
 
     cwd = str(payload.get("cwd") or ".")
     verification, error = verify_repo(cwd)
+    changed_files = [str(path) for path in (verification or {}).get("changed_files") or []]
+    if not changed_files:
+        return 0
+    repo_root = str((verification or {}).get("repo_root") or cwd)
     project_id = str((verification or {}).get("project_id") or hook_state.project_id_for_cwd(cwd))
     session_id = str(payload.get("session_id") or "unknown")
     event = hook_state.HookEvent(
         event_name=str(event_name),
         project_id=project_id,
         session_id=session_id,
-        prompt_is_code_edit=prompt_is_code_edit,
         severity=str((verification or {}).get("severity") or ("error" if error else "ok")),
         recommended_action=str((verification or {}).get("recommended_action") or ("verify_error" if error else "none")),
         stale=bool((verification or {}).get("stale")) or bool(error),
         has_error=bool(error),
+        has_changes=True,
+        change_fingerprint=modification_fingerprint(repo_root, changed_files),
+        build_active=active_build(cwd),
     )
     state = hook_state.load_state()
     decision = hook_state.transition(state, event, hook_state.hook_level())
     hook_state.save_state(decision.state)
     if not decision.should_emit:
         return 0
-    hook_output(event_name, context_for(event_name, verification, error, include_info=decision.include_info, repo=cwd))
+    hook_output(context_for(verification, error, include_info=decision.include_info, repo=cwd))
     return 0
 
 
